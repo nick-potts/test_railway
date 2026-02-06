@@ -524,14 +524,8 @@ async function buildCombinedReport(searchParams) {
     200,
     60000
   );
-  const samplesPerIp = parseIntOrDefault(
-    searchParams.get("samplesPerIp"),
-    SAMPLES_PER_IP_DEFAULT,
-    1,
-    50
-  );
-  const hostnameSamples = parseIntOrDefault(
-    searchParams.get("hostnameSamples"),
+  const dnsSamples = parseIntOrDefault(
+    searchParams.get("dnsSamples") || searchParams.get("hostnameSamples"),
     HOSTNAME_SAMPLES_DEFAULT,
     1,
     500
@@ -550,7 +544,7 @@ async function buildCombinedReport(searchParams) {
   );
   const perSourceTimeoutMs = parseIntOrDefault(
     searchParams.get("perSourceTimeoutMs"),
-    Math.max(8000, timeoutMs * (samplesPerIp + hostnameSamples + 4)),
+    Math.max(8000, timeoutMs * (dnsSamples + 4)),
     1000,
     120000
   );
@@ -571,8 +565,7 @@ async function buildCombinedReport(searchParams) {
 
   const params = new URLSearchParams({
     timeoutMs: String(timeoutMs),
-    samplesPerIp: String(samplesPerIp),
-    hostnameSamples: String(hostnameSamples),
+    dnsSamples: String(dnsSamples),
     sourceConcurrency: String(sourceConcurrency)
   }).toString();
 
@@ -589,14 +582,9 @@ async function buildCombinedReport(searchParams) {
       ? expectedSourceRegions.filter((v) => !aggregate.sourceRegions.includes(v))
       : [];
 
-  const missingExpectedDestRegionsDirect =
+  const missingExpectedDestRegionsDns =
     expectedDestRegions.length > 0
-      ? expectedDestRegions.filter((v) => !aggregate.directDestRegions.includes(v))
-      : [];
-
-  const missingExpectedDestRegionsHostname =
-    expectedDestRegions.length > 0
-      ? expectedDestRegions.filter((v) => !aggregate.hostnameDestRegions.includes(v))
+      ? expectedDestRegions.filter((v) => !aggregate.dnsDestRegions.includes(v))
       : [];
 
   const base = {
@@ -606,8 +594,7 @@ async function buildCombinedReport(searchParams) {
       serviceAUrl: SERVICE_A_URL,
       selfUrl: SELF_URL,
       timeoutMs,
-      samplesPerIp,
-      hostnameSamples,
+      dnsSamples,
       sourceConcurrency,
       fanoutConcurrency,
       perSourceTimeoutMs,
@@ -636,23 +623,21 @@ async function buildCombinedReport(searchParams) {
     bridge: {
       sourceRegions: aggregate.sourceRegions,
       sourceReplicas: aggregate.sourceReplicas,
-      directIpDestRegions: aggregate.directDestRegions,
-      directIpDestReplicas: aggregate.directDestReplicas,
-      hostnameDestRegions: aggregate.hostnameDestRegions,
-      hostnameDestReplicas: aggregate.hostnameDestReplicas,
-      directIpMatrix: aggregate.directMatrix,
-      hostnameMatrix: aggregate.hostnameMatrix,
+      dnsDestRegions: aggregate.dnsDestRegions,
+      dnsDestReplicas: aggregate.dnsDestReplicas,
+      dnsMatrix: aggregate.dnsMatrix,
+      expectedDestIps: aggregate.expectedDestIps,
+      stickinessBySource: aggregate.stickinessBySource,
       errorCounts: aggregate.errorCounts
     },
     expectations: {
       expectedSourceRegions,
       expectedDestRegions,
       missingExpectedSourceRegions,
-      missingExpectedDestRegionsDirect,
-      missingExpectedDestRegionsHostname
+      missingExpectedDestRegionsDns
     },
     note:
-      "directIpMatrix shows source replica region -> destination replica region using explicit destination IPs. hostnameMatrix shows routing when calling service-a by railway.internal hostname."
+      "Source fanout uses service-b replica IPs. Destination routing is measured via DNS hostname calls to service-a.railway.internal only."
   };
 
   if (includeRaw) {
