@@ -1,0 +1,10 @@
+{
+  "name": "railway-dns-service-b",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Service B aggregator for Railway DNS and region diagnostics",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  }
+}
