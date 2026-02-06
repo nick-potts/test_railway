@@ -1833,13 +1833,6 @@ function buildMap2Html() {
       border-radius: 2px;
       flex-shrink: 0;
     }
-    .legend-line-dashed {
-      width: 20px;
-      height: 0;
-      border-top: 2px dashed rgba(122,153,184,0.35);
-      flex-shrink: 0;
-    }
-
     #status-bar {
       padding: 8px 16px;
       font-size: 0.74rem;
@@ -1911,7 +1904,6 @@ function buildMap2Html() {
       <span class="legend-item"><span class="legend-line" style="background:var(--good)"></span>&lt;80ms</span>
       <span class="legend-item"><span class="legend-line" style="background:var(--warn)"></span>80-180ms</span>
       <span class="legend-item"><span class="legend-line" style="background:var(--bad)"></span>&gt;180ms</span>
-      <span class="legend-item"><span class="legend-line-dashed"></span>Unrouted</span>
     </div>
     <div class="section">
       <h2>DNS Routing Pattern</h2>
@@ -2036,7 +2028,7 @@ function buildMap2Html() {
       var midLat = (lat1 + lat2) / 2;
       var midLng = (lng1 + lng2) / 2;
       var dist = Math.sqrt((lat2 - lat1) * (lat2 - lat1) + (dLng) * (dLng));
-      var bulge = Math.min(25, Math.max(5, dist * 0.2));
+      var bulge = Math.max(8, dist * 0.35);
       var perpLat = -(lng2 - lng1);
       var perpLng = (lat2 - lat1);
       var perpLen = Math.sqrt(perpLat * perpLat + perpLng * perpLng) || 1;
@@ -2100,29 +2092,6 @@ function buildMap2Html() {
         var parts = r.split(':');
         ensureRegion(parts[0], 'dest');
         regionInfo[parts[0]].dests.add(parts[1] || parts[0]);
-      });
-
-      var allSrc = srcRegions.length ? srcRegions : Object.keys(regionInfo).filter(function(k) { return regionInfo[k].sources.size > 0; });
-      var allDst = dstRegions.length ? dstRegions : Object.keys(regionInfo).filter(function(k) { return regionInfo[k].dests.size > 0; });
-
-      // Draw unrouted pairs as faint dashed gray lines
-      allSrc.forEach(function(src) {
-        allDst.forEach(function(dst) {
-          if (src === dst) return; // skip same-region for arcs
-          var key = src + '|' + dst;
-          if (lookup[key]) return; // has data, will draw solid arc
-          var srcLL = regionLatLng(src);
-          var dstLL = regionLatLng(dst);
-          var pts = arcPoints(srcLL, dstLL);
-          var line = L.polyline(pts, {
-            color: 'rgba(122,153,184,0.15)',
-            weight: 1,
-            opacity: 1,
-            dashArray: '4 6',
-            interactive: false
-          });
-          arcGroup.addLayer(line);
-        });
       });
 
       // Draw observed routes as solid arcs
