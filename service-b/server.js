@@ -1646,7 +1646,7 @@ function buildMap2Html() {
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Railway Latency Map v2</title>
+  <title>Railway DNS Routing &amp; Latency</title>
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"><\/script>
   <style>
@@ -1672,26 +1672,19 @@ function buildMap2Html() {
       display: flex;
       overflow: hidden;
     }
-    #map-container {
-      flex: 1;
-      position: relative;
-    }
-    #map {
-      width: 100%;
-      height: 100%;
-    }
+    #map-container { flex: 1; position: relative; }
+    #map { width: 100%; height: 100%; }
     .leaflet-container { background: #0a0e1a; }
     .leaflet-tile-pane { opacity: 0.85; }
 
     #sidebar {
-      width: 380px;
-      min-width: 320px;
+      width: 420px;
+      min-width: 340px;
       background: var(--surface);
       border-left: 1px solid var(--surface-border);
       overflow-y: auto;
       display: flex;
       flex-direction: column;
-      gap: 0;
     }
 
     .sidebar-header {
@@ -1736,7 +1729,7 @@ function buildMap2Html() {
 
     .stats-grid {
       display: grid;
-      grid-template-columns: 1fr 1fr;
+      grid-template-columns: 1fr 1fr 1fr;
       gap: 8px;
     }
     .stat-card {
@@ -1757,16 +1750,23 @@ function buildMap2Html() {
       margin-top: 2px;
     }
 
-    .matrix-table {
-      width: 100%;
+    /* NxN grid tables */
+    .nxn-wrap { overflow-x: auto; }
+    .nxn-table {
       border-collapse: collapse;
-      font-size: 0.76rem;
+      font-size: 0.72rem;
+      width: auto;
+      min-width: 100%;
     }
-    .matrix-table th {
-      text-align: left;
-      padding: 6px 6px;
+    .nxn-table th, .nxn-table td {
+      padding: 5px 7px;
+      text-align: center;
+      white-space: nowrap;
+      font-variant-numeric: tabular-nums;
+    }
+    .nxn-table thead th {
       color: var(--muted);
-      font-size: 0.68rem;
+      font-size: 0.65rem;
       text-transform: uppercase;
       letter-spacing: 0.04em;
       font-weight: 600;
@@ -1775,17 +1775,34 @@ function buildMap2Html() {
       top: 0;
       background: var(--surface);
     }
-    .matrix-table td {
-      padding: 5px 6px;
-      border-bottom: 1px solid rgba(100,140,180,0.08);
-      font-variant-numeric: tabular-nums;
+    .nxn-table .row-header {
+      text-align: right;
+      color: var(--accent);
+      font-weight: 600;
+      font-family: "SF Mono", "Menlo", "Consolas", monospace;
+      font-size: 0.68rem;
+      padding-right: 10px;
+      border-right: 1px solid var(--surface-border);
     }
-    .matrix-table tr:hover td {
-      background: rgba(77,201,246,0.06);
+    .nxn-table .col-header {
+      color: var(--dest-color);
+      font-family: "SF Mono", "Menlo", "Consolas", monospace;
     }
-    .table-scroll {
-      max-height: 280px;
-      overflow-y: auto;
+    .nxn-table .row-total {
+      color: var(--muted);
+      font-size: 0.65rem;
+      border-left: 1px solid var(--surface-border);
+      padding-left: 10px;
+    }
+    .nxn-cell {
+      border-radius: 4px;
+      min-width: 48px;
+    }
+    .nxn-cell .hits { font-weight: 700; }
+    .nxn-cell .pct { font-size: 0.6rem; color: var(--muted); display: block; }
+    .nxn-cell.empty { color: rgba(122,153,184,0.3); }
+    .nxn-cell.self-route {
+      border: 1px dashed rgba(77,201,246,0.3);
     }
 
     .legend-bar {
@@ -1816,6 +1833,12 @@ function buildMap2Html() {
       border-radius: 2px;
       flex-shrink: 0;
     }
+    .legend-line-dashed {
+      width: 20px;
+      height: 0;
+      border-top: 2px dashed rgba(122,153,184,0.35);
+      flex-shrink: 0;
+    }
 
     #status-bar {
       padding: 8px 16px;
@@ -1839,16 +1862,8 @@ function buildMap2Html() {
       line-height: 1.5 !important;
       box-shadow: 0 4px 20px rgba(0,0,0,0.5) !important;
     }
-    .arc-tooltip .tip-header {
-      font-weight: 700;
-      margin-bottom: 4px;
-      color: #fff;
-    }
-    .arc-tooltip .tip-row {
-      display: flex;
-      justify-content: space-between;
-      gap: 16px;
-    }
+    .arc-tooltip .tip-header { font-weight: 700; margin-bottom: 4px; color: #fff; }
+    .arc-tooltip .tip-row { display: flex; justify-content: space-between; gap: 16px; }
     .arc-tooltip .tip-label { color: var(--muted); }
     .arc-tooltip .tip-value { font-weight: 600; font-variant-numeric: tabular-nums; }
 
@@ -1860,6 +1875,17 @@ function buildMap2Html() {
       color: var(--text) !important;
       font-size: 0.78rem !important;
       box-shadow: 0 4px 20px rgba(0,0,0,0.5) !important;
+    }
+
+    @keyframes pulse-ring {
+      0%   { transform: scale(1);   opacity: 0.7; }
+      50%  { transform: scale(1.6); opacity: 0; }
+      100% { transform: scale(1);   opacity: 0; }
+    }
+    .self-ring {
+      border-radius: 50%;
+      animation: pulse-ring 2s ease-out infinite;
+      pointer-events: none;
     }
 
     @media (max-width: 860px) {
@@ -1875,44 +1901,35 @@ function buildMap2Html() {
   </div>
   <div id="sidebar">
     <div class="sidebar-header">
-      <h1>Latency Map</h1>
+      <h1>DNS Routing &amp; Latency</h1>
       <button id="refresh-btn">Refresh</button>
     </div>
     <div id="status-bar">Loading...</div>
     <div class="legend-bar">
-      <span class="legend-item"><span class="legend-dot" style="background:var(--source-color)"></span>Source (service-b)</span>
-      <span class="legend-item"><span class="legend-dot" style="background:var(--dest-color)"></span>Dest (service-a)</span>
+      <span class="legend-item"><span class="legend-dot" style="background:var(--source-color)"></span>Source</span>
+      <span class="legend-item"><span class="legend-dot" style="background:var(--dest-color)"></span>Dest</span>
       <span class="legend-item"><span class="legend-line" style="background:var(--good)"></span>&lt;80ms</span>
       <span class="legend-item"><span class="legend-line" style="background:var(--warn)"></span>80-180ms</span>
       <span class="legend-item"><span class="legend-line" style="background:var(--bad)"></span>&gt;180ms</span>
+      <span class="legend-item"><span class="legend-line-dashed"></span>Unrouted</span>
+    </div>
+    <div class="section">
+      <h2>DNS Routing Pattern</h2>
+      <div class="nxn-wrap" id="routing-grid"></div>
+    </div>
+    <div class="section">
+      <h2>Latency Matrix</h2>
+      <div class="nxn-wrap" id="latency-grid"></div>
     </div>
     <div class="section">
       <h2>Summary</h2>
       <div class="stats-grid" id="summary-stats">
-        <div class="stat-card"><div class="label">Source Regions</div><div class="value" id="s-src-regions">-</div></div>
-        <div class="stat-card"><div class="label">Dest Regions</div><div class="value" id="s-dst-regions">-</div></div>
-        <div class="stat-card"><div class="label">Source Replicas</div><div class="value" id="s-src-replicas">-</div></div>
-        <div class="stat-card"><div class="label">Dest Replicas</div><div class="value" id="s-dst-replicas">-</div></div>
+        <div class="stat-card"><div class="label">Src Regions</div><div class="value" id="s-src-regions">-</div></div>
+        <div class="stat-card"><div class="label">Dst Regions</div><div class="value" id="s-dst-regions">-</div></div>
+        <div class="stat-card"><div class="label">Src Replicas</div><div class="value" id="s-src-replicas">-</div></div>
+        <div class="stat-card"><div class="label">Dst Replicas</div><div class="value" id="s-dst-replicas">-</div></div>
         <div class="stat-card"><div class="label">Avg Latency</div><div class="value" id="s-avg-latency">-</div></div>
         <div class="stat-card"><div class="label">Samples</div><div class="value" id="s-samples">-</div></div>
-      </div>
-    </div>
-    <div class="section">
-      <h2>Region Latency Matrix</h2>
-      <div class="table-scroll">
-        <table class="matrix-table">
-          <thead><tr><th>Source</th><th>Dest</th><th>Hits</th><th>Avg</th><th>Min</th><th>Max</th></tr></thead>
-          <tbody id="matrix-body"></tbody>
-        </table>
-      </div>
-    </div>
-    <div class="section">
-      <h2>Replica Links</h2>
-      <div class="table-scroll">
-        <table class="matrix-table">
-          <thead><tr><th>Source</th><th>Dest</th><th>Hits</th><th>Avg</th><th>P95</th></tr></thead>
-          <tbody id="replica-body"></tbody>
-        </table>
       </div>
     </div>
   </div>
@@ -2000,8 +2017,11 @@ function buildMap2Html() {
       return (v != null && isFinite(v)) ? v.toFixed(1) : '-';
     }
 
-    function shortReplica(id) {
-      return id ? id.slice(0, 8) : '?';
+    function shortRegion(r) {
+      return r.replace(/^(us|europe|asia|australia|southamerica)-/, function(m, p) {
+        var abbr = { us:'us', europe:'eu', asia:'as', australia:'au', southamerica:'sa' };
+        return (abbr[p] || p) + '-';
+      });
     }
 
     function arcPoints(from, to, numPoints) {
@@ -2040,18 +2060,27 @@ function buildMap2Html() {
       return Math.max(1.5, Math.min(6, 1.5 + (hits || 0) / 5));
     }
 
-    var lastData = null;
+    function buildLookup(matrix) {
+      var m = {};
+      (matrix || []).forEach(function(e) {
+        var key = e.sourceRegion + '|' + e.destRegion;
+        m[key] = e;
+      });
+      return m;
+    }
 
     function renderMap(data) {
-      lastData = data;
       arcGroup.clearLayers();
       nodeGroup.clearLayers();
 
       var bridge = data.bridge || {};
       var matrix = bridge.dnsMatrix || [];
-      var replicaLinks = bridge.replicaLatencyLinks || [];
+      var srcRegions = bridge.sourceRegions || [];
+      var dstRegions = bridge.dnsDestRegions || [];
       var sourceReplicas = bridge.sourceReplicas || [];
       var destReplicas = bridge.dnsDestReplicas || [];
+
+      var lookup = buildLookup(matrix);
 
       var regionInfo = {};
       function ensureRegion(region, kind) {
@@ -2073,7 +2102,36 @@ function buildMap2Html() {
         regionInfo[parts[0]].dests.add(parts[1] || parts[0]);
       });
 
+      var allSrc = srcRegions.length ? srcRegions : Object.keys(regionInfo).filter(function(k) { return regionInfo[k].sources.size > 0; });
+      var allDst = dstRegions.length ? dstRegions : Object.keys(regionInfo).filter(function(k) { return regionInfo[k].dests.size > 0; });
+
+      // Draw unrouted pairs as faint dashed gray lines
+      allSrc.forEach(function(src) {
+        allDst.forEach(function(dst) {
+          if (src === dst) return; // skip same-region for arcs
+          var key = src + '|' + dst;
+          if (lookup[key]) return; // has data, will draw solid arc
+          var srcLL = regionLatLng(src);
+          var dstLL = regionLatLng(dst);
+          var pts = arcPoints(srcLL, dstLL);
+          var line = L.polyline(pts, {
+            color: 'rgba(122,153,184,0.15)',
+            weight: 1,
+            opacity: 1,
+            dashArray: '4 6',
+            interactive: false
+          });
+          arcGroup.addLayer(line);
+        });
+      });
+
+      // Draw observed routes as solid arcs
+      var selfRouteRegions = {};
       matrix.forEach(function(edge) {
+        if (edge.sourceRegion === edge.destRegion) {
+          selfRouteRegions[edge.sourceRegion] = edge;
+          return;
+        }
         var srcLL = regionLatLng(edge.sourceRegion);
         var dstLL = regionLatLng(edge.destRegion);
         var avg = edge.avgLatencyMs;
@@ -2082,25 +2140,20 @@ function buildMap2Html() {
         var line = L.polyline(pts, {
           color: color,
           weight: strokeW(edge.hits),
-          opacity: 0.7,
-          dashArray: '8 5',
-          className: 'latency-arc'
+          opacity: 0.8
         });
 
-        var srcReps = (edge.sourceReplicas || []).map(shortReplica).join(', ');
-        var dstReps = (edge.destReplicas || []).map(shortReplica).join(', ');
         var tip = '<div class="arc-tooltip">' +
           '<div class="tip-header">' + edge.sourceRegion + ' \\u2192 ' + edge.destRegion + '</div>' +
           '<div class="tip-row"><span class="tip-label">Avg</span><span class="tip-value ' + msClass(avg) + '">' + fmtMs(avg) + ' ms</span></div>' +
           '<div class="tip-row"><span class="tip-label">Min / Max</span><span class="tip-value">' + fmtMs(edge.minLatencyMs) + ' / ' + fmtMs(edge.maxLatencyMs) + ' ms</span></div>' +
           '<div class="tip-row"><span class="tip-label">Hits</span><span class="tip-value">' + (edge.hits || 0) + '</span></div>' +
-          '<div class="tip-row"><span class="tip-label">Src replicas</span><span class="tip-value">' + (srcReps || '-') + '</span></div>' +
-          '<div class="tip-row"><span class="tip-label">Dst replicas</span><span class="tip-value">' + (dstReps || '-') + '</span></div>' +
           '</div>';
         line.bindTooltip(tip, { sticky: true, className: 'arc-tooltip', direction: 'top' });
         arcGroup.addLayer(line);
       });
 
+      // Draw nodes + self-route pulsing rings
       Object.keys(regionInfo).forEach(function(region) {
         var info = regionInfo[region];
         var ll = info.latLng;
@@ -2136,6 +2189,26 @@ function buildMap2Html() {
           nodeGroup.addLayer(dstMarker);
         }
 
+        // Pulsing ring for same-region routes
+        if (selfRouteRegions[region]) {
+          var selfEdge = selfRouteRegions[region];
+          var ringColor = latencyColor(selfEdge.avgLatencyMs);
+          var ringIcon = L.divIcon({
+            html: '<div class="self-ring" style="width:32px;height:32px;border:3px solid ' + ringColor + ';"></div>',
+            className: '',
+            iconSize: [32, 32],
+            iconAnchor: [16, 16]
+          });
+          var ringMarker = L.marker(ll, { icon: ringIcon, interactive: true });
+          var ringTip = '<div class="arc-tooltip">' +
+            '<div class="tip-header">' + region + ' \\u2192 ' + region + ' (same-region)</div>' +
+            '<div class="tip-row"><span class="tip-label">Avg</span><span class="tip-value ' + msClass(selfEdge.avgLatencyMs) + '">' + fmtMs(selfEdge.avgLatencyMs) + ' ms</span></div>' +
+            '<div class="tip-row"><span class="tip-label">Hits</span><span class="tip-value">' + (selfEdge.hits || 0) + '</span></div>' +
+            '</div>';
+          ringMarker.bindTooltip(ringTip, { className: 'arc-tooltip', direction: 'top', offset: [0, -20] });
+          nodeGroup.addLayer(ringMarker);
+        }
+
         var labelIcon = L.divIcon({
           html: '<div style="color:#d4e4f7;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.04em;text-shadow:0 1px 4px rgba(0,0,0,0.9);white-space:nowrap;pointer-events:none">' + region + '</div>',
           className: '',
@@ -2148,57 +2221,83 @@ function buildMap2Html() {
     function renderSidebar(data) {
       var bridge = data.bridge || {};
       var overall = bridge.latencyOverall || {};
-      var matrix = bridge.regionLatencyMatrix || [];
-      var replicas = bridge.replicaLatencyLinks || [];
+      var matrix = bridge.dnsMatrix || [];
+      var srcRegions = (bridge.sourceRegions || []).slice().sort();
+      var dstRegions = (bridge.dnsDestRegions || []).slice().sort();
 
-      document.getElementById('s-src-regions').textContent = (bridge.sourceRegions || []).length;
-      document.getElementById('s-dst-regions').textContent = (bridge.dnsDestRegions || []).length;
+      // Summary stats
+      document.getElementById('s-src-regions').textContent = srcRegions.length;
+      document.getElementById('s-dst-regions').textContent = dstRegions.length;
       document.getElementById('s-src-replicas').textContent = (bridge.sourceReplicas || []).length;
       document.getElementById('s-dst-replicas').textContent = (bridge.dnsDestReplicas || []).length;
       document.getElementById('s-avg-latency').innerHTML = '<span class="' + msClass(overall.avgLatencyMs) + '">' + fmtMs(overall.avgLatencyMs) + ' ms</span>';
       document.getElementById('s-samples').textContent = overall.count || 0;
 
-      var matrixBody = document.getElementById('matrix-body');
-      matrixBody.innerHTML = '';
-      if (matrix.length === 0) {
-        matrixBody.innerHTML = '<tr><td colspan="6" style="color:var(--muted)">No data</td></tr>';
-      } else {
-        matrix.forEach(function(row) {
-          var tr = document.createElement('tr');
-          tr.innerHTML =
-            '<td class="mono">' + row.sourceRegion + '</td>' +
-            '<td class="mono">' + row.destRegion + '</td>' +
-            '<td>' + (row.hits || 0) + '</td>' +
-            '<td class="' + msClass(row.avgLatencyMs) + '">' + fmtMs(row.avgLatencyMs) + '</td>' +
-            '<td>' + fmtMs(row.minLatencyMs) + '</td>' +
-            '<td>' + fmtMs(row.maxLatencyMs) + '</td>';
-          matrixBody.appendChild(tr);
-        });
-      }
+      var lookup = buildLookup(matrix);
 
-      var replicaBody = document.getElementById('replica-body');
-      replicaBody.innerHTML = '';
-      var sorted = replicas.slice().sort(function(a, b) {
-        var av = (a.latency && isFinite(a.latency.avgMs)) ? a.latency.avgMs : Infinity;
-        var bv = (b.latency && isFinite(b.latency.avgMs)) ? b.latency.avgMs : Infinity;
-        return av - bv;
+      // Compute row totals for routing %
+      var rowTotals = {};
+      srcRegions.forEach(function(src) { rowTotals[src] = 0; });
+      matrix.forEach(function(e) { rowTotals[e.sourceRegion] = (rowTotals[e.sourceRegion] || 0) + (e.hits || 0); });
+
+      // Build DNS Routing Pattern NxN grid
+      var routeHtml = '<table class="nxn-table"><thead><tr><th></th>';
+      dstRegions.forEach(function(d) {
+        routeHtml += '<th class="col-header">' + shortRegion(d) + '</th>';
       });
-      if (sorted.length === 0) {
-        replicaBody.innerHTML = '<tr><td colspan="5" style="color:var(--muted)">No data</td></tr>';
-      } else {
-        sorted.forEach(function(row) {
-          var avg = row.latency ? row.latency.avgMs : null;
-          var p95 = row.latency ? row.latency.p95Ms : null;
-          var tr = document.createElement('tr');
-          tr.innerHTML =
-            '<td class="mono">' + row.sourceRegion + ':' + shortReplica(row.sourceReplicaId) + '</td>' +
-            '<td class="mono">' + row.destRegion + ':' + shortReplica(row.destReplicaId) + '</td>' +
-            '<td>' + (row.hits || 0) + '</td>' +
-            '<td class="' + msClass(avg) + '">' + fmtMs(avg) + '</td>' +
-            '<td class="' + msClass(p95) + '">' + fmtMs(p95) + '</td>';
-          replicaBody.appendChild(tr);
+      routeHtml += '<th class="row-total">Total</th></tr></thead><tbody>';
+
+      srcRegions.forEach(function(src) {
+        routeHtml += '<tr><td class="row-header">' + shortRegion(src) + '</td>';
+        var total = rowTotals[src] || 0;
+        dstRegions.forEach(function(dst) {
+          var key = src + '|' + dst;
+          var edge = lookup[key];
+          var isSelf = src === dst;
+          if (edge && edge.hits > 0) {
+            var pct = total > 0 ? ((edge.hits / total) * 100) : 0;
+            var intensity = Math.min(1, pct / 100);
+            var bg = 'rgba(77,201,246,' + (0.08 + intensity * 0.4).toFixed(2) + ')';
+            routeHtml += '<td class="nxn-cell' + (isSelf ? ' self-route' : '') + '" style="background:' + bg + '">' +
+              '<span class="hits">' + edge.hits + '</span>' +
+              '<span class="pct">' + pct.toFixed(0) + '%</span></td>';
+          } else {
+            routeHtml += '<td class="nxn-cell empty' + (isSelf ? ' self-route' : '') + '">\\u2014</td>';
+          }
         });
-      }
+        routeHtml += '<td class="row-total mono">' + total + '</td></tr>';
+      });
+      routeHtml += '</tbody></table>';
+      document.getElementById('routing-grid').innerHTML = srcRegions.length === 0
+        ? '<div style="color:var(--muted);font-size:0.78rem">No data</div>'
+        : routeHtml;
+
+      // Build Latency Matrix NxN grid
+      var latHtml = '<table class="nxn-table"><thead><tr><th></th>';
+      dstRegions.forEach(function(d) {
+        latHtml += '<th class="col-header">' + shortRegion(d) + '</th>';
+      });
+      latHtml += '</tr></thead><tbody>';
+
+      srcRegions.forEach(function(src) {
+        latHtml += '<tr><td class="row-header">' + shortRegion(src) + '</td>';
+        dstRegions.forEach(function(dst) {
+          var key = src + '|' + dst;
+          var edge = lookup[key];
+          var isSelf = src === dst;
+          if (edge && edge.avgLatencyMs != null && isFinite(edge.avgLatencyMs)) {
+            var cls = msClass(edge.avgLatencyMs);
+            latHtml += '<td class="nxn-cell ' + cls + (isSelf ? ' self-route' : '') + '">' + fmtMs(edge.avgLatencyMs) + '</td>';
+          } else {
+            latHtml += '<td class="nxn-cell empty' + (isSelf ? ' self-route' : '') + '">\\u2014</td>';
+          }
+        });
+        latHtml += '</tr>';
+      });
+      latHtml += '</tbody></table>';
+      document.getElementById('latency-grid').innerHTML = srcRegions.length === 0
+        ? '<div style="color:var(--muted);font-size:0.78rem">No data</div>'
+        : latHtml;
     }
 
     var loading = false;
