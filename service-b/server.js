@@ -29,6 +29,8 @@ function json(res, status, payload) {
 }
 
 function parseIntOrDefault(raw, fallback, min = 1, max = 1000) {
+  if (raw === null || raw === undefined) return fallback;
+  if (typeof raw === "string" && raw.trim() === "") return fallback;
   const parsed = Number(raw);
   if (!Number.isFinite(parsed)) return fallback;
   return Math.max(min, Math.min(max, Math.floor(parsed)));
