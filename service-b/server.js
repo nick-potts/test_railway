@@ -12,7 +12,12 @@ const SELF_URL = (
   `http://${process.env.RAILWAY_PRIVATE_DOMAIN || `${SERVICE_NAME}.railway.internal`}:${PORT}`
 ).replace(/\/+$/, "");
 const SERVICE_A_EXPECTED_NAME = process.env.SERVICE_A_EXPECTED_NAME || "service-a";
-const TARGET_REGION_COUNT_DEFAULT = Number(process.env.TARGET_REGION_COUNT || 3);
+const TARGET_SELF_REGION_COUNT_DEFAULT = Number(
+  process.env.TARGET_SELF_REGION_COUNT || process.env.TARGET_REGION_COUNT || 3
+);
+const TARGET_REMOTE_REGION_COUNT_DEFAULT = Number(
+  process.env.TARGET_REMOTE_REGION_COUNT || process.env.TARGET_REGION_COUNT || 3
+);
 const MAX_ROUNDS_DEFAULT = Number(process.env.MAX_ROUNDS || 8);
 const SAMPLES_PER_ROUND_DEFAULT = Number(process.env.SAMPLES_PER_ROUND || 20);
 const SAMPLE_CONCURRENCY_DEFAULT = Number(process.env.SAMPLE_CONCURRENCY || 10);
@@ -268,26 +273,114 @@ function aggregateIdentities(identities) {
   };
 }
 
-function parseExpectedRegions(searchParams) {
-  const fromQuery = (searchParams.get("expectedRegions") || "")
+function parseRegionList(raw) {
+  return (raw || "")
     .split(",")
     .map((v) => v.trim())
     .filter(Boolean);
+}
+
+function parseExpectedSourceRegions(searchParams) {
+  const fromQuery = parseRegionList(searchParams.get("expectedSourceRegions"));
   if (fromQuery.length > 0) return fromQuery;
-  return (process.env.EXPECTED_REGIONS || "")
-    .split(",")
-    .map((v) => v.trim())
-    .filter(Boolean);
+  return parseRegionList(process.env.EXPECTED_SOURCE_REGIONS);
+}
+
+function parseExpectedDestRegions(searchParams) {
+  const fromQuerySpecific = parseRegionList(searchParams.get("expectedDestRegions"));
+  if (fromQuerySpecific.length > 0) return fromQuerySpecific;
+
+  const fromQueryLegacy = parseRegionList(searchParams.get("expectedRegions"));
+  if (fromQueryLegacy.length > 0) return fromQueryLegacy;
+
+  return parseRegionList(process.env.EXPECTED_DEST_REGIONS || process.env.EXPECTED_REGIONS);
 }
 
 function buildDigQuery(targets) {
   return targets.map((host) => `host=${encodeURIComponent(host)}`).join("&");
 }
 
+function summarizeBridgeResults(results) {
+  const matrix = new Map();
+  const sourceRegions = new Set();
+  const destRegions = new Set();
+  const sourceReplicas = new Set();
+  const destReplicas = new Set();
+  const errors = {};
+  let okPairs = 0;
+
+  for (const result of results) {
+    if (!(result && result.ok && result.status >= 200 && result.status < 300)) {
+      const key = result?.error || (result?.status !== null ? `http_${result?.status}` : "unknown_error");
+      errors[key] = (errors[key] || 0) + 1;
+      continue;
+    }
+
+    const local = extractIdentity(result.data?.local);
+    const remote = extractIdentity(result.data?.remote?.data);
+    if (!local || !remote) {
+      errors.missing_pair_identity = (errors.missing_pair_identity || 0) + 1;
+      continue;
+    }
+
+    okPairs += 1;
+    sourceRegions.add(local.region);
+    destRegions.add(remote.region);
+    sourceReplicas.add(`${local.region}:${local.replicaId}`);
+    destReplicas.add(`${remote.region}:${remote.replicaId}`);
+
+    const edge = `${local.region}=>${remote.region}`;
+    if (!matrix.has(edge)) {
+      matrix.set(edge, {
+        sourceRegion: local.region,
+        destRegion: remote.region,
+        hits: 0,
+        sourceReplicas: new Set(),
+        destReplicas: new Set()
+      });
+    }
+
+    const item = matrix.get(edge);
+    item.hits += 1;
+    item.sourceReplicas.add(local.replicaId);
+    item.destReplicas.add(remote.replicaId);
+  }
+
+  return {
+    attempted: results.length,
+    okPairs,
+    failedPairs: results.length - okPairs,
+    sourceRegions: Array.from(sourceRegions).sort(),
+    destRegions: Array.from(destRegions).sort(),
+    sourceReplicaCount: sourceReplicas.size,
+    destReplicaCount: destReplicas.size,
+    sourceReplicas: Array.from(sourceReplicas).sort(),
+    destReplicas: Array.from(destReplicas).sort(),
+    errorCounts: errors,
+    matrix: Array.from(matrix.values())
+      .map((v) => ({
+        sourceRegion: v.sourceRegion,
+        destRegion: v.destRegion,
+        hits: v.hits,
+        sourceReplicaCount: v.sourceReplicas.size,
+        destReplicaCount: v.destReplicas.size,
+        sourceReplicas: Array.from(v.sourceReplicas).sort(),
+        destReplicas: Array.from(v.destReplicas).sort()
+      }))
+      .sort((a, b) => `${a.sourceRegion}:${a.destRegion}`.localeCompare(`${b.sourceRegion}:${b.destRegion}`))
+  };
+}
+
 async function buildCombinedReport(searchParams) {
-  const targetRegionCount = parseIntOrDefault(
-    searchParams.get("targetRegions"),
-    TARGET_REGION_COUNT_DEFAULT,
+  const targetSelfRegionCount = parseIntOrDefault(
+    searchParams.get("targetSelfRegions"),
+    parseIntOrDefault(searchParams.get("targetRegions"), TARGET_SELF_REGION_COUNT_DEFAULT, 1, 16),
+    1,
+    16
+  );
+  const targetRemoteRegionCount = parseIntOrDefault(
+    searchParams.get("targetRemoteRegions"),
+    parseIntOrDefault(searchParams.get("targetRegions"), TARGET_REMOTE_REGION_COUNT_DEFAULT, 1, 16),
     1,
     16
   );
@@ -314,6 +407,7 @@ async function buildCombinedReport(searchParams) {
 
   const serviceAWhoamiUrl = `${SERVICE_A_URL}/whoami`;
   const selfWhoamiUrl = `${SELF_URL}/whoami`;
+  const bridgeProbeUrl = `${SELF_URL}/probe-once`;
   const serviceAHost = getServiceAHost();
   const selfHost = getSelfHost();
 
@@ -324,19 +418,23 @@ async function buildCombinedReport(searchParams) {
 
   const allSelfResults = [];
   const allServiceAResults = [];
+  const allBridgeResults = [];
   const roundSummaries = [];
 
   for (let round = 1; round <= maxRounds; round += 1) {
-    const [selfRound, serviceARound] = await Promise.all([
+    const [selfRound, serviceARound, bridgeRound] = await Promise.all([
       sampleUrl(selfWhoamiUrl, samplesPerRound, sampleConcurrency, timeoutMs),
-      sampleUrl(serviceAWhoamiUrl, samplesPerRound, sampleConcurrency, timeoutMs)
+      sampleUrl(serviceAWhoamiUrl, samplesPerRound, sampleConcurrency, timeoutMs),
+      sampleUrl(bridgeProbeUrl, samplesPerRound, sampleConcurrency, timeoutMs)
     ]);
     allSelfResults.push(...selfRound);
     allServiceAResults.push(...serviceARound);
+    allBridgeResults.push(...bridgeRound);
 
     const selfSummary = summarizeResults(allSelfResults);
     const serviceASummary = summarizeResults(allServiceAResults);
     const aggregate = aggregateIdentities([...selfSummary.identities, ...serviceASummary.identities]);
+    const bridgeSummary = summarizeBridgeResults(allBridgeResults);
 
     roundSummaries.push({
       round,
@@ -351,24 +449,34 @@ async function buildCombinedReport(searchParams) {
         okResponses: serviceASummary.okResponses,
         uniqueReplicas: new Set(serviceASummary.identities.map((v) => `${v.region}:${v.replicaId}`)).size,
         seenRegions: Array.from(new Set(serviceASummary.identities.map((v) => v.region))).sort()
+      },
+      bridge: {
+        attempted: bridgeSummary.attempted,
+        okPairs: bridgeSummary.okPairs,
+        sourceRegions: bridgeSummary.sourceRegions,
+        destRegions: bridgeSummary.destRegions
       }
     });
 
-    const selfEntry = aggregate.byService.find((v) => v.service === SERVICE_NAME);
-    const serviceAEntry = aggregate.byService.find((v) => v.service === SERVICE_A_EXPECTED_NAME);
     const reachedTargets =
-      (selfEntry?.regionCount || 0) >= targetRegionCount &&
-      (serviceAEntry?.regionCount || 0) >= targetRegionCount;
+      bridgeSummary.sourceRegions.length >= targetSelfRegionCount &&
+      bridgeSummary.destRegions.length >= targetRemoteRegionCount;
     if (reachedTargets) break;
   }
 
   const selfSummary = summarizeResults(allSelfResults);
   const serviceASummary = summarizeResults(allServiceAResults);
+  const bridgeSummary = summarizeBridgeResults(allBridgeResults);
   const aggregate = aggregateIdentities([...selfSummary.identities, ...serviceASummary.identities]);
-  const expectedRegions = parseExpectedRegions(searchParams);
-  const missingExpectedRegions =
-    expectedRegions.length > 0
-      ? expectedRegions.filter((region) => !aggregate.seenRegions.includes(region))
+  const expectedSourceRegions = parseExpectedSourceRegions(searchParams);
+  const expectedDestRegions = parseExpectedDestRegions(searchParams);
+  const missingExpectedSourceRegions =
+    expectedSourceRegions.length > 0
+      ? expectedSourceRegions.filter((region) => !bridgeSummary.sourceRegions.includes(region))
+      : [];
+  const missingExpectedDestRegions =
+    expectedDestRegions.length > 0
+      ? expectedDestRegions.filter((region) => !bridgeSummary.destRegions.includes(region))
       : [];
 
   const base = {
@@ -378,12 +486,14 @@ async function buildCombinedReport(searchParams) {
       serviceAUrl: SERVICE_A_URL,
       selfUrl: SELF_URL,
       serviceAExpectedName: SERVICE_A_EXPECTED_NAME,
-      targetRegionCount,
+      targetSelfRegionCount,
+      targetRemoteRegionCount,
       maxRounds,
       samplesPerRound,
       sampleConcurrency,
       timeoutMs,
-      expectedRegions
+      expectedSourceRegions,
+      expectedDestRegions
     },
     dig: {
       fromServiceB: localDig,
@@ -404,11 +514,25 @@ async function buildCombinedReport(searchParams) {
         errorCounts: serviceASummary.errorCounts
       }
     },
+    bridge: {
+      attempted: bridgeSummary.attempted,
+      okPairs: bridgeSummary.okPairs,
+      failedPairs: bridgeSummary.failedPairs,
+      sourceRegions: bridgeSummary.sourceRegions,
+      destRegions: bridgeSummary.destRegions,
+      sourceReplicaCount: bridgeSummary.sourceReplicaCount,
+      destReplicaCount: bridgeSummary.destReplicaCount,
+      sourceReplicas: bridgeSummary.sourceReplicas,
+      destReplicas: bridgeSummary.destReplicas,
+      errorCounts: bridgeSummary.errorCounts,
+      matrix: bridgeSummary.matrix
+    },
     aggregate: {
       byServiceRegion: aggregate.byServiceRegion,
       byService: aggregate.byService,
       seenRegions: aggregate.seenRegions,
-      missingExpectedRegions
+      missingExpectedSourceRegions,
+      missingExpectedDestRegions
     },
     discoveredReplicas: {
       self: Array.from(
@@ -419,7 +543,7 @@ async function buildCombinedReport(searchParams) {
       ).sort()
     },
     note:
-      "This endpoint reports regions/replicas observed by internal probes. If a region is missing, increase rounds/samples, verify replica distribution, and verify private DNS targets."
+      "For mismatch tests (for example service-b in 2 regions and service-a in 3), inspect bridge.matrix for sourceRegion=>destRegion hit distribution."
   };
 
   if (includeRaw) {
@@ -427,7 +551,8 @@ async function buildCombinedReport(searchParams) {
       ...base,
       raw: {
         self: allSelfResults,
-        serviceA: allServiceAResults
+        serviceA: allServiceAResults,
+        bridge: allBridgeResults
       }
     };
   }
