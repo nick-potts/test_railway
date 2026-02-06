@@ -1640,6 +1640,605 @@ function buildMapHtml() {
 </html>`;
 }
 
+function buildMap2Html() {
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Railway Latency Map v2</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"><\/script>
+  <style>
+    :root {
+      --bg: #0a0e1a;
+      --surface: rgba(12, 18, 35, 0.92);
+      --surface-border: rgba(100, 140, 180, 0.18);
+      --text: #d4e4f7;
+      --muted: #7a99b8;
+      --accent: #4dc9f6;
+      --good: #22c993;
+      --warn: #f5a623;
+      --bad: #f25757;
+      --source-color: #4dc9f6;
+      --dest-color: #ffd166;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      height: 100vh;
+      display: flex;
+      overflow: hidden;
+    }
+    #map-container {
+      flex: 1;
+      position: relative;
+    }
+    #map {
+      width: 100%;
+      height: 100%;
+    }
+    .leaflet-container { background: #0a0e1a; }
+    .leaflet-tile-pane { opacity: 0.85; }
+
+    #sidebar {
+      width: 380px;
+      min-width: 320px;
+      background: var(--surface);
+      border-left: 1px solid var(--surface-border);
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 0;
+    }
+
+    .sidebar-header {
+      padding: 16px;
+      border-bottom: 1px solid var(--surface-border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+    }
+    .sidebar-header h1 {
+      font-size: 0.95rem;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      white-space: nowrap;
+    }
+    #refresh-btn {
+      background: rgba(77, 201, 246, 0.12);
+      border: 1px solid rgba(77, 201, 246, 0.3);
+      color: var(--accent);
+      padding: 6px 14px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 0.8rem;
+      font-weight: 600;
+      transition: background 0.15s;
+    }
+    #refresh-btn:hover { background: rgba(77, 201, 246, 0.22); }
+    #refresh-btn:disabled { opacity: 0.4; cursor: default; }
+
+    .section {
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--surface-border);
+    }
+    .section h2 {
+      font-size: 0.78rem;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted);
+      margin-bottom: 10px;
+    }
+
+    .stats-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
+    .stat-card {
+      background: rgba(255,255,255,0.03);
+      border: 1px solid rgba(100,140,180,0.1);
+      border-radius: 8px;
+      padding: 8px 10px;
+    }
+    .stat-card .label {
+      font-size: 0.7rem;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    .stat-card .value {
+      font-size: 1.1rem;
+      font-weight: 700;
+      margin-top: 2px;
+    }
+
+    .matrix-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.76rem;
+    }
+    .matrix-table th {
+      text-align: left;
+      padding: 6px 6px;
+      color: var(--muted);
+      font-size: 0.68rem;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      font-weight: 600;
+      border-bottom: 1px solid var(--surface-border);
+      position: sticky;
+      top: 0;
+      background: var(--surface);
+    }
+    .matrix-table td {
+      padding: 5px 6px;
+      border-bottom: 1px solid rgba(100,140,180,0.08);
+      font-variant-numeric: tabular-nums;
+    }
+    .matrix-table tr:hover td {
+      background: rgba(77,201,246,0.06);
+    }
+    .table-scroll {
+      max-height: 280px;
+      overflow-y: auto;
+    }
+
+    .legend-bar {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      padding: 10px 16px;
+      border-bottom: 1px solid var(--surface-border);
+      font-size: 0.74rem;
+      color: var(--muted);
+      flex-wrap: wrap;
+    }
+    .legend-item {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      white-space: nowrap;
+    }
+    .legend-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+    .legend-line {
+      width: 20px;
+      height: 3px;
+      border-radius: 2px;
+      flex-shrink: 0;
+    }
+
+    #status-bar {
+      padding: 8px 16px;
+      font-size: 0.74rem;
+      color: var(--muted);
+      border-bottom: 1px solid var(--surface-border);
+    }
+
+    .mono { font-family: "SF Mono", "Menlo", "Consolas", monospace; }
+    .ms-good { color: var(--good); }
+    .ms-warn { color: var(--warn); }
+    .ms-bad { color: var(--bad); }
+
+    .arc-tooltip {
+      background: rgba(8, 14, 28, 0.94) !important;
+      border: 1px solid rgba(100, 140, 180, 0.3) !important;
+      border-radius: 8px !important;
+      padding: 8px 12px !important;
+      color: var(--text) !important;
+      font-size: 0.78rem !important;
+      line-height: 1.5 !important;
+      box-shadow: 0 4px 20px rgba(0,0,0,0.5) !important;
+    }
+    .arc-tooltip .tip-header {
+      font-weight: 700;
+      margin-bottom: 4px;
+      color: #fff;
+    }
+    .arc-tooltip .tip-row {
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+    }
+    .arc-tooltip .tip-label { color: var(--muted); }
+    .arc-tooltip .tip-value { font-weight: 600; font-variant-numeric: tabular-nums; }
+
+    .region-tooltip {
+      background: rgba(8, 14, 28, 0.94) !important;
+      border: 1px solid rgba(100, 140, 180, 0.3) !important;
+      border-radius: 8px !important;
+      padding: 8px 12px !important;
+      color: var(--text) !important;
+      font-size: 0.78rem !important;
+      box-shadow: 0 4px 20px rgba(0,0,0,0.5) !important;
+    }
+
+    @media (max-width: 860px) {
+      body { flex-direction: column; }
+      #sidebar { width: 100%; min-width: 0; max-height: 45vh; border-left: none; border-top: 1px solid var(--surface-border); }
+      #map-container { min-height: 55vh; }
+    }
+  </style>
+</head>
+<body>
+  <div id="map-container">
+    <div id="map"></div>
+  </div>
+  <div id="sidebar">
+    <div class="sidebar-header">
+      <h1>Latency Map</h1>
+      <button id="refresh-btn">Refresh</button>
+    </div>
+    <div id="status-bar">Loading...</div>
+    <div class="legend-bar">
+      <span class="legend-item"><span class="legend-dot" style="background:var(--source-color)"></span>Source (service-b)</span>
+      <span class="legend-item"><span class="legend-dot" style="background:var(--dest-color)"></span>Dest (service-a)</span>
+      <span class="legend-item"><span class="legend-line" style="background:var(--good)"></span>&lt;80ms</span>
+      <span class="legend-item"><span class="legend-line" style="background:var(--warn)"></span>80-180ms</span>
+      <span class="legend-item"><span class="legend-line" style="background:var(--bad)"></span>&gt;180ms</span>
+    </div>
+    <div class="section">
+      <h2>Summary</h2>
+      <div class="stats-grid" id="summary-stats">
+        <div class="stat-card"><div class="label">Source Regions</div><div class="value" id="s-src-regions">-</div></div>
+        <div class="stat-card"><div class="label">Dest Regions</div><div class="value" id="s-dst-regions">-</div></div>
+        <div class="stat-card"><div class="label">Source Replicas</div><div class="value" id="s-src-replicas">-</div></div>
+        <div class="stat-card"><div class="label">Dest Replicas</div><div class="value" id="s-dst-replicas">-</div></div>
+        <div class="stat-card"><div class="label">Avg Latency</div><div class="value" id="s-avg-latency">-</div></div>
+        <div class="stat-card"><div class="label">Samples</div><div class="value" id="s-samples">-</div></div>
+      </div>
+    </div>
+    <div class="section">
+      <h2>Region Latency Matrix</h2>
+      <div class="table-scroll">
+        <table class="matrix-table">
+          <thead><tr><th>Source</th><th>Dest</th><th>Hits</th><th>Avg</th><th>Min</th><th>Max</th></tr></thead>
+          <tbody id="matrix-body"></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="section">
+      <h2>Replica Links</h2>
+      <div class="table-scroll">
+        <table class="matrix-table">
+          <thead><tr><th>Source</th><th>Dest</th><th>Hits</th><th>Avg</th><th>P95</th></tr></thead>
+          <tbody id="replica-body"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <script>
+  (function() {
+    var REGION_COORDS = {
+      'us-west1':           [37.39, -122.08],
+      'us-west2':           [34.05, -118.24],
+      'us-west3':           [40.76, -111.89],
+      'us-west4':           [36.17, -115.14],
+      'us-central1':        [41.26, -95.86],
+      'us-east1':           [33.75, -84.39],
+      'us-east4':           [37.43, -78.65],
+      'europe-west1':       [50.11, 8.68],
+      'europe-west2':       [51.50, -0.12],
+      'europe-west3':       [50.93, 6.95],
+      'europe-west4':       [52.37, 4.90],
+      'europe-north1':      [60.17, 24.94],
+      'asia-southeast1':    [1.35, 103.82],
+      'asia-southeast2':    [-6.21, 106.85],
+      'asia-east1':         [25.03, 121.56],
+      'asia-east2':         [22.30, 114.16],
+      'asia-northeast1':    [35.67, 139.65],
+      'asia-northeast2':    [37.56, 126.98],
+      'asia-south1':        [19.07, 72.88],
+      'asia-south2':        [17.38, 78.49],
+      'australia-southeast1': [-33.87, 151.21],
+      'southamerica-east1': [-23.55, -46.63]
+    };
+
+    var map = L.map('map', {
+      center: [25, 10],
+      zoom: 2,
+      minZoom: 2,
+      maxZoom: 7,
+      zoomControl: true,
+      attributionControl: false
+    });
+
+    L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_nolabels/{z}/{x}/{y}{r}.png', {
+      subdomains: 'abcd',
+      maxZoom: 19
+    }).addTo(map);
+
+    L.control.attribution({ position: 'bottomleft', prefix: false })
+      .addAttribution('&copy; <a href="https://carto.com/">CARTO</a>')
+      .addTo(map);
+
+    var arcGroup = L.layerGroup().addTo(map);
+    var nodeGroup = L.layerGroup().addTo(map);
+
+    function normalizeRegion(r) {
+      var raw = String(r || 'unknown').toLowerCase();
+      if (REGION_COORDS[raw]) return raw;
+      var stripped = raw.replace(/-[a-z0-9]{4,}$/i, '');
+      if (REGION_COORDS[stripped]) return stripped;
+      return raw;
+    }
+
+    function regionLatLng(region) {
+      var key = normalizeRegion(region);
+      var c = REGION_COORDS[key];
+      if (c) return c;
+      var hash = 0;
+      for (var i = 0; i < region.length; i++) hash = ((hash << 5) - hash + region.charCodeAt(i)) | 0;
+      return [(hash % 60) - 10, ((hash >> 8) % 300) - 150];
+    }
+
+    function latencyColor(ms) {
+      if (ms == null || !isFinite(ms)) return 'rgba(150,180,210,0.5)';
+      if (ms < 80) return '#22c993';
+      if (ms < 180) return '#f5a623';
+      return '#f25757';
+    }
+
+    function msClass(ms) {
+      if (ms == null || !isFinite(ms)) return '';
+      if (ms < 80) return 'ms-good';
+      if (ms < 180) return 'ms-warn';
+      return 'ms-bad';
+    }
+
+    function fmtMs(v) {
+      return (v != null && isFinite(v)) ? v.toFixed(1) : '-';
+    }
+
+    function shortReplica(id) {
+      return id ? id.slice(0, 8) : '?';
+    }
+
+    function arcPoints(from, to, numPoints) {
+      numPoints = numPoints || 40;
+      var pts = [];
+      var lat1 = from[0], lng1 = from[1], lat2 = to[0], lng2 = to[1];
+      var dLng = lng2 - lng1;
+      if (Math.abs(dLng) > 180) {
+        if (dLng > 0) lng1 += 360;
+        else lng2 += 360;
+      }
+      var midLat = (lat1 + lat2) / 2;
+      var midLng = (lng1 + lng2) / 2;
+      var dist = Math.sqrt((lat2 - lat1) * (lat2 - lat1) + (dLng) * (dLng));
+      var bulge = Math.min(25, Math.max(5, dist * 0.2));
+      var perpLat = -(lng2 - lng1);
+      var perpLng = (lat2 - lat1);
+      var perpLen = Math.sqrt(perpLat * perpLat + perpLng * perpLng) || 1;
+      perpLat = perpLat / perpLen * bulge;
+      perpLng = perpLng / perpLen * bulge;
+      var ctrlLat = midLat + perpLat;
+      var ctrlLng = midLng + perpLng;
+      for (var i = 0; i <= numPoints; i++) {
+        var t = i / numPoints;
+        var u = 1 - t;
+        var lat = u * u * lat1 + 2 * u * t * ctrlLat + t * t * lat2;
+        var lng = u * u * lng1 + 2 * u * t * ctrlLng + t * t * lng2;
+        if (lng > 180) lng -= 360;
+        if (lng < -180) lng += 360;
+        pts.push([lat, lng]);
+      }
+      return pts;
+    }
+
+    function strokeW(hits) {
+      return Math.max(1.5, Math.min(6, 1.5 + (hits || 0) / 5));
+    }
+
+    var lastData = null;
+
+    function renderMap(data) {
+      lastData = data;
+      arcGroup.clearLayers();
+      nodeGroup.clearLayers();
+
+      var bridge = data.bridge || {};
+      var matrix = bridge.dnsMatrix || [];
+      var replicaLinks = bridge.replicaLatencyLinks || [];
+      var sourceReplicas = bridge.sourceReplicas || [];
+      var destReplicas = bridge.dnsDestReplicas || [];
+
+      var regionInfo = {};
+      function ensureRegion(region, kind) {
+        if (!regionInfo[region]) {
+          regionInfo[region] = { sources: new Set(), dests: new Set(), latLng: regionLatLng(region) };
+        }
+        if (kind === 'source') regionInfo[region].sources.add(region);
+        if (kind === 'dest') regionInfo[region].dests.add(region);
+      }
+
+      sourceReplicas.forEach(function(r) {
+        var parts = r.split(':');
+        ensureRegion(parts[0], 'source');
+        regionInfo[parts[0]].sources.add(parts[1] || parts[0]);
+      });
+      destReplicas.forEach(function(r) {
+        var parts = r.split(':');
+        ensureRegion(parts[0], 'dest');
+        regionInfo[parts[0]].dests.add(parts[1] || parts[0]);
+      });
+
+      matrix.forEach(function(edge) {
+        var srcLL = regionLatLng(edge.sourceRegion);
+        var dstLL = regionLatLng(edge.destRegion);
+        var avg = edge.avgLatencyMs;
+        var color = latencyColor(avg);
+        var pts = arcPoints(srcLL, dstLL);
+        var line = L.polyline(pts, {
+          color: color,
+          weight: strokeW(edge.hits),
+          opacity: 0.7,
+          dashArray: '8 5',
+          className: 'latency-arc'
+        });
+
+        var srcReps = (edge.sourceReplicas || []).map(shortReplica).join(', ');
+        var dstReps = (edge.destReplicas || []).map(shortReplica).join(', ');
+        var tip = '<div class="arc-tooltip">' +
+          '<div class="tip-header">' + edge.sourceRegion + ' \\u2192 ' + edge.destRegion + '</div>' +
+          '<div class="tip-row"><span class="tip-label">Avg</span><span class="tip-value ' + msClass(avg) + '">' + fmtMs(avg) + ' ms</span></div>' +
+          '<div class="tip-row"><span class="tip-label">Min / Max</span><span class="tip-value">' + fmtMs(edge.minLatencyMs) + ' / ' + fmtMs(edge.maxLatencyMs) + ' ms</span></div>' +
+          '<div class="tip-row"><span class="tip-label">Hits</span><span class="tip-value">' + (edge.hits || 0) + '</span></div>' +
+          '<div class="tip-row"><span class="tip-label">Src replicas</span><span class="tip-value">' + (srcReps || '-') + '</span></div>' +
+          '<div class="tip-row"><span class="tip-label">Dst replicas</span><span class="tip-value">' + (dstReps || '-') + '</span></div>' +
+          '</div>';
+        line.bindTooltip(tip, { sticky: true, className: 'arc-tooltip', direction: 'top' });
+        arcGroup.addLayer(line);
+      });
+
+      Object.keys(regionInfo).forEach(function(region) {
+        var info = regionInfo[region];
+        var ll = info.latLng;
+        var srcCount = info.sources.size;
+        var dstCount = info.dests.size;
+        var hasSrc = srcCount > 0;
+        var hasDst = dstCount > 0;
+
+        if (hasSrc) {
+          var srcMarker = L.circleMarker(ll, {
+            radius: Math.min(16, 7 + srcCount),
+            fillColor: '#4dc9f6',
+            fillOpacity: 0.85,
+            color: 'rgba(77,201,246,0.4)',
+            weight: 2
+          });
+          var srcTip = '<div class="region-tooltip"><strong>' + region + '</strong> (source)<br>' + srcCount + ' replica(s)</div>';
+          srcMarker.bindTooltip(srcTip, { className: 'region-tooltip', direction: 'top', offset: [0, -10] });
+          nodeGroup.addLayer(srcMarker);
+        }
+
+        if (hasDst) {
+          var offset = hasSrc ? [0.8, 0.8] : [0, 0];
+          var dstMarker = L.circleMarker([ll[0] - offset[0], ll[1] + offset[1]], {
+            radius: Math.min(16, 7 + dstCount),
+            fillColor: '#ffd166',
+            fillOpacity: 0.85,
+            color: 'rgba(255,209,102,0.4)',
+            weight: 2
+          });
+          var dstTip = '<div class="region-tooltip"><strong>' + region + '</strong> (dest)<br>' + dstCount + ' replica(s)</div>';
+          dstMarker.bindTooltip(dstTip, { className: 'region-tooltip', direction: 'top', offset: [0, -10] });
+          nodeGroup.addLayer(dstMarker);
+        }
+
+        var labelIcon = L.divIcon({
+          html: '<div style="color:#d4e4f7;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.04em;text-shadow:0 1px 4px rgba(0,0,0,0.9);white-space:nowrap;pointer-events:none">' + region + '</div>',
+          className: '',
+          iconAnchor: [-8, 20]
+        });
+        L.marker(ll, { icon: labelIcon, interactive: false }).addTo(nodeGroup);
+      });
+    }
+
+    function renderSidebar(data) {
+      var bridge = data.bridge || {};
+      var overall = bridge.latencyOverall || {};
+      var matrix = bridge.regionLatencyMatrix || [];
+      var replicas = bridge.replicaLatencyLinks || [];
+
+      document.getElementById('s-src-regions').textContent = (bridge.sourceRegions || []).length;
+      document.getElementById('s-dst-regions').textContent = (bridge.dnsDestRegions || []).length;
+      document.getElementById('s-src-replicas').textContent = (bridge.sourceReplicas || []).length;
+      document.getElementById('s-dst-replicas').textContent = (bridge.dnsDestReplicas || []).length;
+      document.getElementById('s-avg-latency').innerHTML = '<span class="' + msClass(overall.avgLatencyMs) + '">' + fmtMs(overall.avgLatencyMs) + ' ms</span>';
+      document.getElementById('s-samples').textContent = overall.count || 0;
+
+      var matrixBody = document.getElementById('matrix-body');
+      matrixBody.innerHTML = '';
+      if (matrix.length === 0) {
+        matrixBody.innerHTML = '<tr><td colspan="6" style="color:var(--muted)">No data</td></tr>';
+      } else {
+        matrix.forEach(function(row) {
+          var tr = document.createElement('tr');
+          tr.innerHTML =
+            '<td class="mono">' + row.sourceRegion + '</td>' +
+            '<td class="mono">' + row.destRegion + '</td>' +
+            '<td>' + (row.hits || 0) + '</td>' +
+            '<td class="' + msClass(row.avgLatencyMs) + '">' + fmtMs(row.avgLatencyMs) + '</td>' +
+            '<td>' + fmtMs(row.minLatencyMs) + '</td>' +
+            '<td>' + fmtMs(row.maxLatencyMs) + '</td>';
+          matrixBody.appendChild(tr);
+        });
+      }
+
+      var replicaBody = document.getElementById('replica-body');
+      replicaBody.innerHTML = '';
+      var sorted = replicas.slice().sort(function(a, b) {
+        var av = (a.latency && isFinite(a.latency.avgMs)) ? a.latency.avgMs : Infinity;
+        var bv = (b.latency && isFinite(b.latency.avgMs)) ? b.latency.avgMs : Infinity;
+        return av - bv;
+      });
+      if (sorted.length === 0) {
+        replicaBody.innerHTML = '<tr><td colspan="5" style="color:var(--muted)">No data</td></tr>';
+      } else {
+        sorted.forEach(function(row) {
+          var avg = row.latency ? row.latency.avgMs : null;
+          var p95 = row.latency ? row.latency.p95Ms : null;
+          var tr = document.createElement('tr');
+          tr.innerHTML =
+            '<td class="mono">' + row.sourceRegion + ':' + shortReplica(row.sourceReplicaId) + '</td>' +
+            '<td class="mono">' + row.destRegion + ':' + shortReplica(row.destReplicaId) + '</td>' +
+            '<td>' + (row.hits || 0) + '</td>' +
+            '<td class="' + msClass(avg) + '">' + fmtMs(avg) + '</td>' +
+            '<td class="' + msClass(p95) + '">' + fmtMs(p95) + '</td>';
+          replicaBody.appendChild(tr);
+        });
+      }
+    }
+
+    var loading = false;
+    function loadData() {
+      if (loading) return;
+      loading = true;
+      var btn = document.getElementById('refresh-btn');
+      btn.disabled = true;
+      btn.textContent = 'Loading...';
+      document.getElementById('status-bar').textContent = 'Fetching /combined...';
+
+      var query = window.location.search || '';
+      fetch('/combined' + query, { headers: { accept: 'application/json' } })
+        .then(function(r) {
+          if (!r.ok) throw new Error('HTTP ' + r.status);
+          return r.json();
+        })
+        .then(function(data) {
+          renderMap(data);
+          renderSidebar(data);
+          document.getElementById('status-bar').textContent = 'Updated ' + new Date().toLocaleTimeString() + ' \\u2014 generated ' + (data.generatedAt || '?');
+        })
+        .catch(function(err) {
+          document.getElementById('status-bar').textContent = 'Error: ' + (err.message || err);
+        })
+        .finally(function() {
+          loading = false;
+          btn.disabled = false;
+          btn.textContent = 'Refresh';
+        });
+    }
+
+    document.getElementById('refresh-btn').addEventListener('click', loadData);
+    loadData();
+  })();
+  <\/script>
+</body>
+</html>`;
+}
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
 
