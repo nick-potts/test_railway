@@ -1,6 +1,6 @@
 const http = require("http");
 const os = require("os");
-const { URL } = require("url");
+const { URL, URLSearchParams } = require("url");
 const { execFile } = require("child_process");
 const dns = require("dns").promises;
 
@@ -11,17 +11,12 @@ const SELF_URL = (
   process.env.SELF_URL ||
   `http://${process.env.RAILWAY_PRIVATE_DOMAIN || `${SERVICE_NAME}.railway.internal`}:${PORT}`
 ).replace(/\/+$/, "");
-const SERVICE_A_EXPECTED_NAME = process.env.SERVICE_A_EXPECTED_NAME || "service-a";
-const TARGET_SELF_REGION_COUNT_DEFAULT = Number(
-  process.env.TARGET_SELF_REGION_COUNT || process.env.TARGET_REGION_COUNT || 3
-);
-const TARGET_REMOTE_REGION_COUNT_DEFAULT = Number(
-  process.env.TARGET_REMOTE_REGION_COUNT || process.env.TARGET_REGION_COUNT || 3
-);
-const MAX_ROUNDS_DEFAULT = Number(process.env.MAX_ROUNDS || 8);
-const SAMPLES_PER_ROUND_DEFAULT = Number(process.env.SAMPLES_PER_ROUND || 20);
-const SAMPLE_CONCURRENCY_DEFAULT = Number(process.env.SAMPLE_CONCURRENCY || 10);
-const REQUEST_TIMEOUT_MS_DEFAULT = Number(process.env.REQUEST_TIMEOUT_MS || 2000);
+
+const REQUEST_TIMEOUT_MS_DEFAULT = Number(process.env.REQUEST_TIMEOUT_MS || 3000);
+const SAMPLES_PER_IP_DEFAULT = Number(process.env.SAMPLES_PER_IP || 2);
+const HOSTNAME_SAMPLES_DEFAULT = Number(process.env.HOSTNAME_SAMPLES || 12);
+const SOURCE_CONCURRENCY_DEFAULT = Number(process.env.SOURCE_CONCURRENCY || 10);
+const FANOUT_CONCURRENCY_DEFAULT = Number(process.env.FANOUT_CONCURRENCY || 10);
 
 function json(res, status, payload) {
   res.writeHead(status, { "content-type": "application/json; charset=utf-8" });
@@ -36,6 +31,13 @@ function parseIntOrDefault(raw, fallback, min = 1, max = 1000) {
   return Math.max(min, Math.min(max, Math.floor(parsed)));
 }
 
+function parseRegionList(raw) {
+  return (raw || "")
+    .split(",")
+    .map((v) => v.trim())
+    .filter(Boolean);
+}
+
 function safeUrl(url) {
   try {
     return new URL(url);
@@ -44,15 +46,47 @@ function safeUrl(url) {
   }
 }
 
+function getHost(url, fallback) {
+  const parsed = safeUrl(url);
+  return parsed ? parsed.hostname : fallback;
+}
+
+function getPort(url, fallbackPort) {
+  const parsed = safeUrl(url);
+  if (!parsed) return fallbackPort;
+  if (parsed.port) return Number(parsed.port);
+  return parsed.protocol === "https:" ? 443 : 80;
+}
+
 function getServiceAHost() {
-  const parsed = safeUrl(SERVICE_A_URL);
-  return parsed ? parsed.hostname : process.env.SERVICE_A_HOST || "service-a.railway.internal";
+  return getHost(SERVICE_A_URL, "service-a.railway.internal");
+}
+
+function getServiceAPort() {
+  return getPort(SERVICE_A_URL, 8080);
 }
 
 function getSelfHost() {
   if (process.env.RAILWAY_PRIVATE_DOMAIN) return process.env.RAILWAY_PRIVATE_DOMAIN;
-  const parsed = safeUrl(SELF_URL);
-  return parsed ? parsed.hostname : `${SERVICE_NAME}.railway.internal`;
+  return getHost(SELF_URL, `${SERVICE_NAME}.railway.internal`);
+}
+
+function getSelfPort() {
+  return getPort(SELF_URL, PORT);
+}
+
+function parseExpectedSourceRegions(searchParams) {
+  const fromQuery = parseRegionList(searchParams.get("expectedSourceRegions"));
+  if (fromQuery.length > 0) return fromQuery;
+  return parseRegionList(process.env.EXPECTED_SOURCE_REGIONS);
+}
+
+function parseExpectedDestRegions(searchParams) {
+  const fromQuerySpecific = parseRegionList(searchParams.get("expectedDestRegions"));
+  if (fromQuerySpecific.length > 0) return fromQuerySpecific;
+  const fromQueryLegacy = parseRegionList(searchParams.get("expectedRegions"));
+  if (fromQueryLegacy.length > 0) return fromQueryLegacy;
+  return parseRegionList(process.env.EXPECTED_DEST_REGIONS || process.env.EXPECTED_REGIONS);
 }
 
 function identity() {
@@ -73,6 +107,16 @@ function identity() {
       deploymentId: process.env.RAILWAY_DEPLOYMENT_ID || null
     },
     now: new Date().toISOString()
+  };
+}
+
+function extractIdentity(payload) {
+  if (!payload || typeof payload !== "object") return null;
+  return {
+    service: payload.service || payload.railway?.serviceName || "unknown",
+    region: payload.railway?.replicaRegion || payload.region || "unknown",
+    replicaId: payload.railway?.replicaId || payload.replicaId || payload.hostname || "unknown",
+    hostname: payload.hostname || null
   };
 }
 
@@ -108,11 +152,13 @@ async function dnsSnapshot(host) {
   } catch (error) {
     lookup = { error: error.message };
   }
+
   const [a, aaaa, cname] = await Promise.all([
     dig(host, "A"),
     dig(host, "AAAA"),
     dig(host, "CNAME")
   ]);
+
   return {
     host,
     lookup,
@@ -120,18 +166,37 @@ async function dnsSnapshot(host) {
   };
 }
 
-async function fetchJson(url, timeoutMs) {
+function isIpv4(value) {
+  return /^\d{1,3}(\.\d{1,3}){3}$/.test(value);
+}
+
+async function resolveARecords(host) {
+  try {
+    const records = await dns.resolve4(host);
+    return Array.from(new Set(records.filter(isIpv4))).sort();
+  } catch {
+    const a = await dig(host, "A");
+    if (!a.ok) return [];
+    return Array.from(new Set(a.lines.filter(isIpv4))).sort();
+  }
+}
+
+async function fetchJson(url, timeoutMs, extraHeaders = {}) {
   const startedAt = Date.now();
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const response = await fetch(url, {
       method: "GET",
-      headers: { accept: "application/json" },
+      headers: {
+        accept: "application/json",
+        connection: "close",
+        ...extraHeaders
+      },
       signal: controller.signal
     });
     const text = await response.text();
-    let data = null;
+    let data;
     try {
       data = JSON.parse(text);
     } catch {
@@ -157,209 +222,339 @@ async function fetchJson(url, timeoutMs) {
   }
 }
 
-async function sampleUrl(url, count, concurrency, timeoutMs) {
-  const safeCount = Math.max(0, count);
-  const safeConcurrency = Math.max(1, Math.min(safeCount || 1, concurrency));
-  const results = new Array(safeCount);
+async function mapWithConcurrency(items, concurrency, handler) {
+  const safeConcurrency = Math.max(1, Math.min(items.length || 1, concurrency));
+  const output = new Array(items.length);
   let next = 0;
 
   async function worker() {
     while (true) {
-      const current = next++;
-      if (current >= safeCount) return;
-      results[current] = await fetchJson(url, timeoutMs);
+      const index = next++;
+      if (index >= items.length) return;
+      output[index] = await handler(items[index], index);
     }
   }
 
   await Promise.all(Array.from({ length: safeConcurrency }, () => worker()));
-  return results;
+  return output;
 }
 
-function extractIdentity(payload) {
-  if (!payload || typeof payload !== "object") return null;
+async function sampleUrl(url, count, concurrency, timeoutMs, headers = {}) {
+  const safeCount = Math.max(0, count);
+  const indexes = Array.from({ length: safeCount }, (_, i) => i);
+  return mapWithConcurrency(indexes, concurrency, async () => fetchJson(url, timeoutMs, headers));
+}
+
+function summarizeIdentities(identities) {
+  const byRegion = new Map();
+  const byReplica = new Map();
+  const regions = new Set();
+  const replicas = new Set();
+
+  for (const item of identities) {
+    const region = item.region || "unknown";
+    const replicaId = item.replicaId || "unknown";
+    const service = item.service || "unknown";
+    regions.add(region);
+    replicas.add(`${region}:${replicaId}`);
+
+    if (!byRegion.has(region)) byRegion.set(region, 0);
+    byRegion.set(region, byRegion.get(region) + 1);
+
+    const replicaKey = `${service}:${region}:${replicaId}`;
+    if (!byReplica.has(replicaKey)) {
+      byReplica.set(replicaKey, { service, region, replicaId, hits: 0 });
+    }
+    byReplica.get(replicaKey).hits += 1;
+  }
+
   return {
-    service: payload.service || payload.railway?.serviceName || "unknown",
-    region: payload.railway?.replicaRegion || payload.region || "unknown",
-    replicaId: payload.railway?.replicaId || payload.replicaId || payload.hostname || "unknown",
-    hostname: payload.hostname || null
+    regions: Array.from(regions).sort(),
+    replicas: Array.from(replicas).sort(),
+    byRegion: Array.from(byRegion.entries())
+      .map(([region, hits]) => ({ region, hits }))
+      .sort((a, b) => a.region.localeCompare(b.region)),
+    byReplica: Array.from(byReplica.values()).sort((a, b) =>
+      `${a.service}:${a.region}:${a.replicaId}`.localeCompare(`${b.service}:${b.region}:${b.replicaId}`)
+    )
   };
 }
 
-function summarizeResults(results) {
+function summarizeHttpResults(results) {
   const identities = [];
-  const errors = [];
-  let okResponses = 0;
+  const errorCounts = {};
 
   for (const result of results) {
     if (result && result.ok && result.status >= 200 && result.status < 300) {
-      okResponses += 1;
       const id = extractIdentity(result.data);
       if (id) {
         identities.push(id);
       } else {
-        errors.push("missing_identity_payload");
+        errorCounts.missing_identity_payload = (errorCounts.missing_identity_payload || 0) + 1;
       }
       continue;
     }
-    if (result && result.error) {
-      errors.push(result.error);
-    } else if (result && result.status !== null) {
-      errors.push(`http_${result.status}`);
-    } else {
-      errors.push("unknown_error");
-    }
-  }
-
-  const uniqueErrorCounts = {};
-  for (const error of errors) {
-    uniqueErrorCounts[error] = (uniqueErrorCounts[error] || 0) + 1;
+    const key = result?.error || (result?.status !== null ? `http_${result.status}` : "unknown_error");
+    errorCounts[key] = (errorCounts[key] || 0) + 1;
   }
 
   return {
     attempted: results.length,
-    okResponses,
-    failedResponses: results.length - okResponses,
+    okResponses: identities.length,
+    failedResponses: results.length - identities.length,
+    errorCounts,
     identities,
-    errorCounts: uniqueErrorCounts
+    identitySummary: summarizeIdentities(identities)
   };
 }
 
-function aggregateIdentities(identities) {
-  const byServiceRegion = new Map();
-  const byService = new Map();
-  const seenRegions = new Set();
-
+function pickResolvedIdentity(identities) {
+  if (identities.length === 0) return null;
+  const counts = new Map();
   for (const id of identities) {
-    const service = id.service || "unknown";
-    const region = id.region || "unknown";
-    const replicaId = id.replicaId || "unknown";
-    seenRegions.add(region);
-
-    const srKey = `${service}::${region}`;
-    if (!byServiceRegion.has(srKey)) {
-      byServiceRegion.set(srKey, { service, region, hits: 0, replicas: new Set() });
-    }
-    const sr = byServiceRegion.get(srKey);
-    sr.hits += 1;
-    sr.replicas.add(replicaId);
-
-    if (!byService.has(service)) {
-      byService.set(service, { service, hits: 0, regions: new Set(), replicas: new Set() });
-    }
-    const s = byService.get(service);
-    s.hits += 1;
-    s.regions.add(region);
-    s.replicas.add(replicaId);
+    const key = `${id.service}:${id.region}:${id.replicaId}`;
+    if (!counts.has(key)) counts.set(key, { id, hits: 0 });
+    counts.get(key).hits += 1;
   }
+  return Array.from(counts.values()).sort((a, b) => b.hits - a.hits)[0].id;
+}
+
+async function probeIpTargets({
+  ips,
+  port,
+  hostHeader,
+  path,
+  samplesPerIp,
+  timeoutMs,
+  concurrency
+}) {
+  return mapWithConcurrency(ips, concurrency, async (ip) => {
+    const targetUrl = `http://${ip}:${port}${path}`;
+    const results = await sampleUrl(
+      targetUrl,
+      samplesPerIp,
+      Math.min(samplesPerIp, 4),
+      timeoutMs,
+      hostHeader ? { host: hostHeader } : {}
+    );
+    const summary = summarizeHttpResults(results);
+    return {
+      ip,
+      targetUrl,
+      attempted: summary.attempted,
+      okResponses: summary.okResponses,
+      failedResponses: summary.failedResponses,
+      errorCounts: summary.errorCounts,
+      resolvedIdentity: pickResolvedIdentity(summary.identities),
+      observedIdentities: summary.identitySummary.byReplica
+    };
+  });
+}
+
+async function buildLocalProbeReport(searchParams) {
+  const timeoutMs = parseIntOrDefault(
+    searchParams.get("timeoutMs"),
+    REQUEST_TIMEOUT_MS_DEFAULT,
+    200,
+    60000
+  );
+  const samplesPerIp = parseIntOrDefault(
+    searchParams.get("samplesPerIp"),
+    SAMPLES_PER_IP_DEFAULT,
+    1,
+    50
+  );
+  const hostnameSamples = parseIntOrDefault(
+    searchParams.get("hostnameSamples"),
+    HOSTNAME_SAMPLES_DEFAULT,
+    1,
+    500
+  );
+  const sourceConcurrency = parseIntOrDefault(
+    searchParams.get("sourceConcurrency"),
+    SOURCE_CONCURRENCY_DEFAULT,
+    1,
+    100
+  );
+
+  const serviceAHost = getServiceAHost();
+  const serviceAPort = getServiceAPort();
+  const selfHost = getSelfHost();
+  const selfPort = getSelfPort();
+
+  const [serviceAIps, selfIps, serviceADns, selfDns] = await Promise.all([
+    resolveARecords(serviceAHost),
+    resolveARecords(selfHost),
+    dnsSnapshot(serviceAHost),
+    dnsSnapshot(selfHost)
+  ]);
+
+  const [hostnameResults, directIpTargets] = await Promise.all([
+    sampleUrl(
+      `${SERVICE_A_URL}/whoami`,
+      hostnameSamples,
+      Math.min(sourceConcurrency, hostnameSamples),
+      timeoutMs
+    ),
+    probeIpTargets({
+      ips: serviceAIps,
+      port: serviceAPort,
+      hostHeader: serviceAHost,
+      path: "/whoami",
+      samplesPerIp,
+      timeoutMs,
+      concurrency: sourceConcurrency
+    })
+  ]);
+
+  const hostnameSummary = summarizeHttpResults(hostnameResults);
+  const directIdentities = directIpTargets
+    .map((v) => v.resolvedIdentity)
+    .filter(Boolean);
 
   return {
-    byServiceRegion: Array.from(byServiceRegion.values())
-      .map((v) => ({
-        service: v.service,
-        region: v.region,
-        hits: v.hits,
-        replicas: Array.from(v.replicas).sort(),
-        replicaCount: v.replicas.size
-      }))
-      .sort((a, b) => `${a.service}:${a.region}`.localeCompare(`${b.service}:${b.region}`)),
-    byService: Array.from(byService.values())
-      .map((v) => ({
-        service: v.service,
-        hits: v.hits,
-        regions: Array.from(v.regions).sort(),
-        regionCount: v.regions.size,
-        replicaCount: v.replicas.size
-      }))
-      .sort((a, b) => a.service.localeCompare(b.service)),
-    seenRegions: Array.from(seenRegions).sort()
+    generatedAt: new Date().toISOString(),
+    local: identity(),
+    config: {
+      serviceAUrl: SERVICE_A_URL,
+      selfUrl: SELF_URL,
+      timeoutMs,
+      samplesPerIp,
+      hostnameSamples,
+      sourceConcurrency
+    },
+    discovery: {
+      serviceA: {
+        host: serviceAHost,
+        port: serviceAPort,
+        ips: serviceAIps
+      },
+      self: {
+        host: selfHost,
+        port: selfPort,
+        ips: selfIps
+      }
+    },
+    dig: {
+      serviceA: serviceADns,
+      self: selfDns
+    },
+    hostnameProbe: {
+      attempted: hostnameSummary.attempted,
+      okResponses: hostnameSummary.okResponses,
+      failedResponses: hostnameSummary.failedResponses,
+      errorCounts: hostnameSummary.errorCounts,
+      identitySummary: hostnameSummary.identitySummary
+    },
+    directIpProbe: {
+      attemptedTargets: directIpTargets.length,
+      reachableTargets: directIpTargets.filter((v) => v.okResponses > 0).length,
+      targets: directIpTargets,
+      identitySummary: summarizeIdentities(directIdentities)
+    }
   };
 }
 
-function parseRegionList(raw) {
-  return (raw || "")
-    .split(",")
-    .map((v) => v.trim())
-    .filter(Boolean);
-}
-
-function parseExpectedSourceRegions(searchParams) {
-  const fromQuery = parseRegionList(searchParams.get("expectedSourceRegions"));
-  if (fromQuery.length > 0) return fromQuery;
-  return parseRegionList(process.env.EXPECTED_SOURCE_REGIONS);
-}
-
-function parseExpectedDestRegions(searchParams) {
-  const fromQuerySpecific = parseRegionList(searchParams.get("expectedDestRegions"));
-  if (fromQuerySpecific.length > 0) return fromQuerySpecific;
-
-  const fromQueryLegacy = parseRegionList(searchParams.get("expectedRegions"));
-  if (fromQueryLegacy.length > 0) return fromQueryLegacy;
-
-  return parseRegionList(process.env.EXPECTED_DEST_REGIONS || process.env.EXPECTED_REGIONS);
-}
-
-function buildDigQuery(targets) {
-  return targets.map((host) => `host=${encodeURIComponent(host)}`).join("&");
-}
-
-function summarizeBridgeResults(results) {
-  const matrix = new Map();
+function aggregateSourceReports(sourceResults) {
   const sourceRegions = new Set();
-  const destRegions = new Set();
   const sourceReplicas = new Set();
-  const destReplicas = new Set();
+  const directDestRegions = new Set();
+  const directDestReplicas = new Set();
+  const hostnameDestRegions = new Set();
+  const hostnameDestReplicas = new Set();
+  const directMatrix = new Map();
+  const hostnameMatrix = new Map();
   const errors = {};
-  let okPairs = 0;
 
-  for (const result of results) {
-    if (!(result && result.ok && result.status >= 200 && result.status < 300)) {
-      const key = result?.error || (result?.status !== null ? `http_${result?.status}` : "unknown_error");
+  for (const source of sourceResults) {
+    if (!(source.response && source.response.ok && source.response.status >= 200 && source.response.status < 300)) {
+      const key =
+        source.response?.error ||
+        (source.response?.status !== null ? `http_${source.response?.status}` : "unknown_error");
       errors[key] = (errors[key] || 0) + 1;
       continue;
     }
 
-    const local = extractIdentity(result.data?.local);
-    const remote = extractIdentity(result.data?.remote?.data);
-    if (!local || !remote) {
-      errors.missing_pair_identity = (errors.missing_pair_identity || 0) + 1;
+    const report = source.response.data;
+    const sourceId = extractIdentity(report?.local);
+    if (!sourceId) {
+      errors.missing_source_identity = (errors.missing_source_identity || 0) + 1;
       continue;
     }
 
-    okPairs += 1;
-    sourceRegions.add(local.region);
-    destRegions.add(remote.region);
-    sourceReplicas.add(`${local.region}:${local.replicaId}`);
-    destReplicas.add(`${remote.region}:${remote.replicaId}`);
+    sourceRegions.add(sourceId.region);
+    sourceReplicas.add(`${sourceId.region}:${sourceId.replicaId}`);
 
-    const edge = `${local.region}=>${remote.region}`;
-    if (!matrix.has(edge)) {
-      matrix.set(edge, {
-        sourceRegion: local.region,
-        destRegion: remote.region,
-        hits: 0,
-        sourceReplicas: new Set(),
-        destReplicas: new Set()
-      });
+    const directTargets = Array.isArray(report?.directIpProbe?.targets) ? report.directIpProbe.targets : [];
+    for (const target of directTargets) {
+      if (!target || !target.resolvedIdentity || target.okResponses <= 0) continue;
+      const dest = target.resolvedIdentity;
+      const edge = `${sourceId.region}=>${dest.region}`;
+      directDestRegions.add(dest.region);
+      directDestReplicas.add(`${dest.region}:${dest.replicaId}`);
+
+      if (!directMatrix.has(edge)) {
+        directMatrix.set(edge, {
+          sourceRegion: sourceId.region,
+          destRegion: dest.region,
+          hits: 0,
+          sourceReplicas: new Set(),
+          destReplicas: new Set(),
+          destIps: new Set()
+        });
+      }
+      const item = directMatrix.get(edge);
+      item.hits += target.okResponses;
+      item.sourceReplicas.add(sourceId.replicaId);
+      item.destReplicas.add(dest.replicaId);
+      item.destIps.add(target.ip);
     }
 
-    const item = matrix.get(edge);
-    item.hits += 1;
-    item.sourceReplicas.add(local.replicaId);
-    item.destReplicas.add(remote.replicaId);
+    const hostnameByReplica = Array.isArray(report?.hostnameProbe?.identitySummary?.byReplica)
+      ? report.hostnameProbe.identitySummary.byReplica
+      : [];
+
+    for (const item of hostnameByReplica) {
+      const edge = `${sourceId.region}=>${item.region}`;
+      hostnameDestRegions.add(item.region);
+      hostnameDestReplicas.add(`${item.region}:${item.replicaId}`);
+
+      if (!hostnameMatrix.has(edge)) {
+        hostnameMatrix.set(edge, {
+          sourceRegion: sourceId.region,
+          destRegion: item.region,
+          hits: 0,
+          sourceReplicas: new Set(),
+          destReplicas: new Set()
+        });
+      }
+      const edgeItem = hostnameMatrix.get(edge);
+      edgeItem.hits += item.hits;
+      edgeItem.sourceReplicas.add(sourceId.replicaId);
+      edgeItem.destReplicas.add(item.replicaId);
+    }
   }
 
   return {
-    attempted: results.length,
-    okPairs,
-    failedPairs: results.length - okPairs,
     sourceRegions: Array.from(sourceRegions).sort(),
-    destRegions: Array.from(destRegions).sort(),
-    sourceReplicaCount: sourceReplicas.size,
-    destReplicaCount: destReplicas.size,
     sourceReplicas: Array.from(sourceReplicas).sort(),
-    destReplicas: Array.from(destReplicas).sort(),
-    errorCounts: errors,
-    matrix: Array.from(matrix.values())
+    directDestRegions: Array.from(directDestRegions).sort(),
+    directDestReplicas: Array.from(directDestReplicas).sort(),
+    hostnameDestRegions: Array.from(hostnameDestRegions).sort(),
+    hostnameDestReplicas: Array.from(hostnameDestReplicas).sort(),
+    directMatrix: Array.from(directMatrix.values())
+      .map((v) => ({
+        sourceRegion: v.sourceRegion,
+        destRegion: v.destRegion,
+        hits: v.hits,
+        sourceReplicaCount: v.sourceReplicas.size,
+        destReplicaCount: v.destReplicas.size,
+        sourceReplicas: Array.from(v.sourceReplicas).sort(),
+        destReplicas: Array.from(v.destReplicas).sort(),
+        destIps: Array.from(v.destIps).sort()
+      }))
+      .sort((a, b) => `${a.sourceRegion}:${a.destRegion}`.localeCompare(`${b.sourceRegion}:${b.destRegion}`)),
+    hostnameMatrix: Array.from(hostnameMatrix.values())
       .map((v) => ({
         sourceRegion: v.sourceRegion,
         destRegion: v.destRegion,
@@ -369,116 +564,110 @@ function summarizeBridgeResults(results) {
         sourceReplicas: Array.from(v.sourceReplicas).sort(),
         destReplicas: Array.from(v.destReplicas).sort()
       }))
-      .sort((a, b) => `${a.sourceRegion}:${a.destRegion}`.localeCompare(`${b.sourceRegion}:${b.destRegion}`))
+      .sort((a, b) => `${a.sourceRegion}:${a.destRegion}`.localeCompare(`${b.sourceRegion}:${b.destRegion}`)),
+    errorCounts: errors
+  };
+}
+
+function compactSourceReport(item) {
+  const report = item.response?.data;
+  return {
+    sourceIp: item.sourceIp,
+    ok: Boolean(item.response?.ok),
+    status: item.response?.status ?? null,
+    elapsedMs: item.response?.elapsedMs ?? null,
+    local: report?.local || null,
+    serviceA: {
+      resolvedIps: report?.discovery?.serviceA?.ips || [],
+      hostnameRegions: report?.hostnameProbe?.identitySummary?.regions || [],
+      hostnameReplicas: report?.hostnameProbe?.identitySummary?.replicas || [],
+      directRegions: report?.directIpProbe?.identitySummary?.regions || [],
+      directReplicas: report?.directIpProbe?.identitySummary?.replicas || []
+    },
+    errors: item.response?.ok ? null : item.response?.error || item.response?.status || "unknown_error"
   };
 }
 
 async function buildCombinedReport(searchParams) {
-  const targetSelfRegionCount = parseIntOrDefault(
-    searchParams.get("targetSelfRegions"),
-    parseIntOrDefault(searchParams.get("targetRegions"), TARGET_SELF_REGION_COUNT_DEFAULT, 1, 16),
-    1,
-    16
-  );
-  const targetRemoteRegionCount = parseIntOrDefault(
-    searchParams.get("targetRemoteRegions"),
-    parseIntOrDefault(searchParams.get("targetRegions"), TARGET_REMOTE_REGION_COUNT_DEFAULT, 1, 16),
-    1,
-    16
-  );
-  const maxRounds = parseIntOrDefault(searchParams.get("rounds"), MAX_ROUNDS_DEFAULT, 1, 50);
-  const samplesPerRound = parseIntOrDefault(
-    searchParams.get("samplesPerRound"),
-    SAMPLES_PER_ROUND_DEFAULT,
-    1,
-    1000
-  );
-  const sampleConcurrency = parseIntOrDefault(
-    searchParams.get("concurrency"),
-    SAMPLE_CONCURRENCY_DEFAULT,
-    1,
-    200
-  );
   const timeoutMs = parseIntOrDefault(
     searchParams.get("timeoutMs"),
     REQUEST_TIMEOUT_MS_DEFAULT,
     200,
-    20000
+    60000
+  );
+  const samplesPerIp = parseIntOrDefault(
+    searchParams.get("samplesPerIp"),
+    SAMPLES_PER_IP_DEFAULT,
+    1,
+    50
+  );
+  const hostnameSamples = parseIntOrDefault(
+    searchParams.get("hostnameSamples"),
+    HOSTNAME_SAMPLES_DEFAULT,
+    1,
+    500
+  );
+  const sourceConcurrency = parseIntOrDefault(
+    searchParams.get("sourceConcurrency"),
+    SOURCE_CONCURRENCY_DEFAULT,
+    1,
+    100
+  );
+  const fanoutConcurrency = parseIntOrDefault(
+    searchParams.get("fanoutConcurrency"),
+    FANOUT_CONCURRENCY_DEFAULT,
+    1,
+    100
+  );
+  const perSourceTimeoutMs = parseIntOrDefault(
+    searchParams.get("perSourceTimeoutMs"),
+    Math.max(8000, timeoutMs * (samplesPerIp + hostnameSamples + 4)),
+    1000,
+    120000
   );
   const includeRaw = searchParams.get("includeRaw") === "1";
 
-  const serviceAWhoamiUrl = `${SERVICE_A_URL}/whoami`;
-  const selfWhoamiUrl = `${SELF_URL}/whoami`;
-  const bridgeProbeUrl = `${SELF_URL}/probe-once`;
-  const serviceAHost = getServiceAHost();
-  const selfHost = getSelfHost();
-
-  const [localDig, serviceADigFromA] = await Promise.all([
-    Promise.all([dnsSnapshot(serviceAHost), dnsSnapshot(selfHost)]),
-    fetchJson(`${SERVICE_A_URL}/dig?${buildDigQuery([serviceAHost, selfHost])}`, timeoutMs)
-  ]);
-
-  const allSelfResults = [];
-  const allServiceAResults = [];
-  const allBridgeResults = [];
-  const roundSummaries = [];
-
-  for (let round = 1; round <= maxRounds; round += 1) {
-    const [selfRound, serviceARound, bridgeRound] = await Promise.all([
-      sampleUrl(selfWhoamiUrl, samplesPerRound, sampleConcurrency, timeoutMs),
-      sampleUrl(serviceAWhoamiUrl, samplesPerRound, sampleConcurrency, timeoutMs),
-      sampleUrl(bridgeProbeUrl, samplesPerRound, sampleConcurrency, timeoutMs)
-    ]);
-    allSelfResults.push(...selfRound);
-    allServiceAResults.push(...serviceARound);
-    allBridgeResults.push(...bridgeRound);
-
-    const selfSummary = summarizeResults(allSelfResults);
-    const serviceASummary = summarizeResults(allServiceAResults);
-    const aggregate = aggregateIdentities([...selfSummary.identities, ...serviceASummary.identities]);
-    const bridgeSummary = summarizeBridgeResults(allBridgeResults);
-
-    roundSummaries.push({
-      round,
-      self: {
-        attempted: selfSummary.attempted,
-        okResponses: selfSummary.okResponses,
-        uniqueReplicas: new Set(selfSummary.identities.map((v) => `${v.region}:${v.replicaId}`)).size,
-        seenRegions: Array.from(new Set(selfSummary.identities.map((v) => v.region))).sort()
-      },
-      serviceA: {
-        attempted: serviceASummary.attempted,
-        okResponses: serviceASummary.okResponses,
-        uniqueReplicas: new Set(serviceASummary.identities.map((v) => `${v.region}:${v.replicaId}`)).size,
-        seenRegions: Array.from(new Set(serviceASummary.identities.map((v) => v.region))).sort()
-      },
-      bridge: {
-        attempted: bridgeSummary.attempted,
-        okPairs: bridgeSummary.okPairs,
-        sourceRegions: bridgeSummary.sourceRegions,
-        destRegions: bridgeSummary.destRegions
-      }
-    });
-
-    const reachedTargets =
-      bridgeSummary.sourceRegions.length >= targetSelfRegionCount &&
-      bridgeSummary.destRegions.length >= targetRemoteRegionCount;
-    if (reachedTargets) break;
-  }
-
-  const selfSummary = summarizeResults(allSelfResults);
-  const serviceASummary = summarizeResults(allServiceAResults);
-  const bridgeSummary = summarizeBridgeResults(allBridgeResults);
-  const aggregate = aggregateIdentities([...selfSummary.identities, ...serviceASummary.identities]);
   const expectedSourceRegions = parseExpectedSourceRegions(searchParams);
   const expectedDestRegions = parseExpectedDestRegions(searchParams);
+
+  const serviceAHost = getServiceAHost();
+  const serviceAPort = getServiceAPort();
+  const selfHost = getSelfHost();
+  const selfPort = getSelfPort();
+
+  const [sourceIps, localDig] = await Promise.all([
+    resolveARecords(selfHost),
+    Promise.all([dnsSnapshot(serviceAHost), dnsSnapshot(selfHost)])
+  ]);
+
+  const params = new URLSearchParams({
+    timeoutMs: String(timeoutMs),
+    samplesPerIp: String(samplesPerIp),
+    hostnameSamples: String(hostnameSamples),
+    sourceConcurrency: String(sourceConcurrency)
+  }).toString();
+
+  const sourceResults = await mapWithConcurrency(sourceIps, fanoutConcurrency, async (sourceIp) => {
+    const url = `http://${sourceIp}:${selfPort}/probe-direct?${params}`;
+    const response = await fetchJson(url, perSourceTimeoutMs, { host: selfHost });
+    return { sourceIp, response };
+  });
+
+  const aggregate = aggregateSourceReports(sourceResults);
+
   const missingExpectedSourceRegions =
     expectedSourceRegions.length > 0
-      ? expectedSourceRegions.filter((region) => !bridgeSummary.sourceRegions.includes(region))
+      ? expectedSourceRegions.filter((v) => !aggregate.sourceRegions.includes(v))
       : [];
-  const missingExpectedDestRegions =
+
+  const missingExpectedDestRegionsDirect =
     expectedDestRegions.length > 0
-      ? expectedDestRegions.filter((region) => !bridgeSummary.destRegions.includes(region))
+      ? expectedDestRegions.filter((v) => !aggregate.directDestRegions.includes(v))
+      : [];
+
+  const missingExpectedDestRegionsHostname =
+    expectedDestRegions.length > 0
+      ? expectedDestRegions.filter((v) => !aggregate.hostnameDestRegions.includes(v))
       : [];
 
   const base = {
@@ -487,79 +676,67 @@ async function buildCombinedReport(searchParams) {
     config: {
       serviceAUrl: SERVICE_A_URL,
       selfUrl: SELF_URL,
-      serviceAExpectedName: SERVICE_A_EXPECTED_NAME,
-      targetSelfRegionCount,
-      targetRemoteRegionCount,
-      maxRounds,
-      samplesPerRound,
-      sampleConcurrency,
       timeoutMs,
+      samplesPerIp,
+      hostnameSamples,
+      sourceConcurrency,
+      fanoutConcurrency,
+      perSourceTimeoutMs,
       expectedSourceRegions,
       expectedDestRegions
     },
-    dig: {
-      fromServiceB: localDig,
-      fromServiceA: serviceADigFromA
-    },
-    rounds: roundSummaries,
-    summaries: {
-      self: {
-        attempted: selfSummary.attempted,
-        okResponses: selfSummary.okResponses,
-        failedResponses: selfSummary.failedResponses,
-        errorCounts: selfSummary.errorCounts
+    discovery: {
+      sourceService: {
+        host: selfHost,
+        port: selfPort,
+        resolvedIps: sourceIps
       },
-      serviceA: {
-        attempted: serviceASummary.attempted,
-        okResponses: serviceASummary.okResponses,
-        failedResponses: serviceASummary.failedResponses,
-        errorCounts: serviceASummary.errorCounts
+      destService: {
+        host: serviceAHost,
+        port: serviceAPort
       }
     },
+    dig: {
+      fromServiceB: localDig
+    },
+    fanout: {
+      attemptedSourceIps: sourceIps.length,
+      sourceIpsWithResponse: sourceResults.filter((v) => v.response?.ok).length,
+      sourceIpsWithError: sourceResults.filter((v) => !v.response?.ok).length
+    },
     bridge: {
-      attempted: bridgeSummary.attempted,
-      okPairs: bridgeSummary.okPairs,
-      failedPairs: bridgeSummary.failedPairs,
-      sourceRegions: bridgeSummary.sourceRegions,
-      destRegions: bridgeSummary.destRegions,
-      sourceReplicaCount: bridgeSummary.sourceReplicaCount,
-      destReplicaCount: bridgeSummary.destReplicaCount,
-      sourceReplicas: bridgeSummary.sourceReplicas,
-      destReplicas: bridgeSummary.destReplicas,
-      errorCounts: bridgeSummary.errorCounts,
-      matrix: bridgeSummary.matrix
+      sourceRegions: aggregate.sourceRegions,
+      sourceReplicas: aggregate.sourceReplicas,
+      directIpDestRegions: aggregate.directDestRegions,
+      directIpDestReplicas: aggregate.directDestReplicas,
+      hostnameDestRegions: aggregate.hostnameDestRegions,
+      hostnameDestReplicas: aggregate.hostnameDestReplicas,
+      directIpMatrix: aggregate.directMatrix,
+      hostnameMatrix: aggregate.hostnameMatrix,
+      errorCounts: aggregate.errorCounts
     },
-    aggregate: {
-      byServiceRegion: aggregate.byServiceRegion,
-      byService: aggregate.byService,
-      seenRegions: aggregate.seenRegions,
+    expectations: {
+      expectedSourceRegions,
+      expectedDestRegions,
       missingExpectedSourceRegions,
-      missingExpectedDestRegions
-    },
-    discoveredReplicas: {
-      self: Array.from(
-        new Set(selfSummary.identities.map((v) => `${v.region}:${v.replicaId}`))
-      ).sort(),
-      serviceA: Array.from(
-        new Set(serviceASummary.identities.map((v) => `${v.region}:${v.replicaId}`))
-      ).sort()
+      missingExpectedDestRegionsDirect,
+      missingExpectedDestRegionsHostname
     },
     note:
-      "For mismatch tests (for example service-b in 2 regions and service-a in 3), inspect bridge.matrix for sourceRegion=>destRegion hit distribution."
+      "directIpMatrix shows source replica region -> destination replica region using explicit destination IPs. hostnameMatrix shows routing when calling service-a by railway.internal hostname."
   };
 
   if (includeRaw) {
     return {
       ...base,
-      raw: {
-        self: allSelfResults,
-        serviceA: allServiceAResults,
-        bridge: allBridgeResults
-      }
+      raw: sourceResults
     };
   }
 
-  return base;
+  return {
+    ...base,
+    sourceReports: sourceResults.map(compactSourceReport)
+  };
 }
 
 const server = http.createServer(async (req, res) => {
@@ -581,6 +758,12 @@ const server = http.createServer(async (req, res) => {
       local: identity(),
       remote
     });
+    return;
+  }
+
+  if (url.pathname === "/probe-direct") {
+    const report = await buildLocalProbeReport(url.searchParams);
+    json(res, 200, report);
     return;
   }
 
