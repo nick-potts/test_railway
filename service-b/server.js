@@ -413,12 +413,11 @@ async function buildLocalProbeReport(searchParams) {
 function aggregateSourceReports(sourceResults) {
   const sourceRegions = new Set();
   const sourceReplicas = new Set();
-  const directDestRegions = new Set();
-  const directDestReplicas = new Set();
-  const hostnameDestRegions = new Set();
-  const hostnameDestReplicas = new Set();
-  const directMatrix = new Map();
-  const hostnameMatrix = new Map();
+  const dnsDestRegions = new Set();
+  const dnsDestReplicas = new Set();
+  const dnsMatrix = new Map();
+  const expectedDestIps = new Set();
+  const stickinessBySource = [];
   const errors = {};
 
   for (const source of sourceResults) {
@@ -440,42 +439,22 @@ function aggregateSourceReports(sourceResults) {
     sourceRegions.add(sourceId.region);
     sourceReplicas.add(`${sourceId.region}:${sourceId.replicaId}`);
 
-    const directTargets = Array.isArray(report?.directIpProbe?.targets) ? report.directIpProbe.targets : [];
-    for (const target of directTargets) {
-      if (!target || !target.resolvedIdentity || target.okResponses <= 0) continue;
-      const dest = target.resolvedIdentity;
-      const edge = `${sourceId.region}=>${dest.region}`;
-      directDestRegions.add(dest.region);
-      directDestReplicas.add(`${dest.region}:${dest.replicaId}`);
+    const sourceExpectedIps = Array.isArray(report?.discovery?.serviceA?.ips)
+      ? report.discovery.serviceA.ips
+      : [];
+    for (const ip of sourceExpectedIps) expectedDestIps.add(ip);
 
-      if (!directMatrix.has(edge)) {
-        directMatrix.set(edge, {
-          sourceRegion: sourceId.region,
-          destRegion: dest.region,
-          hits: 0,
-          sourceReplicas: new Set(),
-          destReplicas: new Set(),
-          destIps: new Set()
-        });
-      }
-      const item = directMatrix.get(edge);
-      item.hits += target.okResponses;
-      item.sourceReplicas.add(sourceId.replicaId);
-      item.destReplicas.add(dest.replicaId);
-      item.destIps.add(target.ip);
-    }
-
-    const hostnameByReplica = Array.isArray(report?.hostnameProbe?.identitySummary?.byReplica)
-      ? report.hostnameProbe.identitySummary.byReplica
+    const dnsByReplica = Array.isArray(report?.dnsProbe?.identitySummary?.byReplica)
+      ? report.dnsProbe.identitySummary.byReplica
       : [];
 
-    for (const item of hostnameByReplica) {
+    for (const item of dnsByReplica) {
       const edge = `${sourceId.region}=>${item.region}`;
-      hostnameDestRegions.add(item.region);
-      hostnameDestReplicas.add(`${item.region}:${item.replicaId}`);
+      dnsDestRegions.add(item.region);
+      dnsDestReplicas.add(`${item.region}:${item.replicaId}`);
 
-      if (!hostnameMatrix.has(edge)) {
-        hostnameMatrix.set(edge, {
+      if (!dnsMatrix.has(edge)) {
+        dnsMatrix.set(edge, {
           sourceRegion: sourceId.region,
           destRegion: item.region,
           hits: 0,
@@ -483,33 +462,25 @@ function aggregateSourceReports(sourceResults) {
           destReplicas: new Set()
         });
       }
-      const edgeItem = hostnameMatrix.get(edge);
+      const edgeItem = dnsMatrix.get(edge);
       edgeItem.hits += item.hits;
       edgeItem.sourceReplicas.add(sourceId.replicaId);
       edgeItem.destReplicas.add(item.replicaId);
     }
+
+    stickinessBySource.push({
+      sourceReplica: `${sourceId.region}:${sourceId.replicaId}`,
+      sourceRegion: sourceId.region,
+      ...report?.dnsProbe?.stickiness
+    });
   }
 
   return {
     sourceRegions: Array.from(sourceRegions).sort(),
     sourceReplicas: Array.from(sourceReplicas).sort(),
-    directDestRegions: Array.from(directDestRegions).sort(),
-    directDestReplicas: Array.from(directDestReplicas).sort(),
-    hostnameDestRegions: Array.from(hostnameDestRegions).sort(),
-    hostnameDestReplicas: Array.from(hostnameDestReplicas).sort(),
-    directMatrix: Array.from(directMatrix.values())
-      .map((v) => ({
-        sourceRegion: v.sourceRegion,
-        destRegion: v.destRegion,
-        hits: v.hits,
-        sourceReplicaCount: v.sourceReplicas.size,
-        destReplicaCount: v.destReplicas.size,
-        sourceReplicas: Array.from(v.sourceReplicas).sort(),
-        destReplicas: Array.from(v.destReplicas).sort(),
-        destIps: Array.from(v.destIps).sort()
-      }))
-      .sort((a, b) => `${a.sourceRegion}:${a.destRegion}`.localeCompare(`${b.sourceRegion}:${b.destRegion}`)),
-    hostnameMatrix: Array.from(hostnameMatrix.values())
+    dnsDestRegions: Array.from(dnsDestRegions).sort(),
+    dnsDestReplicas: Array.from(dnsDestReplicas).sort(),
+    dnsMatrix: Array.from(dnsMatrix.values())
       .map((v) => ({
         sourceRegion: v.sourceRegion,
         destRegion: v.destRegion,
@@ -520,6 +491,10 @@ function aggregateSourceReports(sourceResults) {
         destReplicas: Array.from(v.destReplicas).sort()
       }))
       .sort((a, b) => `${a.sourceRegion}:${a.destRegion}`.localeCompare(`${b.sourceRegion}:${b.destRegion}`)),
+    expectedDestIps: Array.from(expectedDestIps).sort(),
+    stickinessBySource: stickinessBySource.sort((a, b) =>
+      (a.sourceReplica || "").localeCompare(b.sourceReplica || "")
+    ),
     errorCounts: errors
   };
 }
