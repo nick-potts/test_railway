@@ -335,14 +335,8 @@ async function buildLocalProbeReport(searchParams) {
     200,
     60000
   );
-  const samplesPerIp = parseIntOrDefault(
-    searchParams.get("samplesPerIp"),
-    SAMPLES_PER_IP_DEFAULT,
-    1,
-    50
-  );
-  const hostnameSamples = parseIntOrDefault(
-    searchParams.get("hostnameSamples"),
+  const dnsSamples = parseIntOrDefault(
+    searchParams.get("dnsSamples") || searchParams.get("hostnameSamples"),
     HOSTNAME_SAMPLES_DEFAULT,
     1,
     500
@@ -359,35 +353,24 @@ async function buildLocalProbeReport(searchParams) {
   const selfHost = getSelfHost();
   const selfPort = getSelfPort();
 
-  const [serviceAIps, selfIps, serviceADns, selfDns] = await Promise.all([
+  const [serviceAIps, selfIps, serviceADns, selfDns, serviceADigFromServiceA] = await Promise.all([
     resolveARecords(serviceAHost),
     resolveARecords(selfHost),
     dnsSnapshot(serviceAHost),
-    dnsSnapshot(selfHost)
-  ]);
-
-  const [hostnameResults, directIpTargets] = await Promise.all([
-    sampleUrl(
-      `${SERVICE_A_URL}/whoami`,
-      hostnameSamples,
-      Math.min(sourceConcurrency, hostnameSamples),
+    dnsSnapshot(selfHost),
+    fetchJson(
+      `${SERVICE_A_URL}/dig?host=${encodeURIComponent(serviceAHost)}&host=${encodeURIComponent(selfHost)}`,
       timeoutMs
-    ),
-    probeIpTargets({
-      ips: serviceAIps,
-      port: serviceAPort,
-      hostHeader: serviceAHost,
-      path: "/whoami",
-      samplesPerIp,
-      timeoutMs,
-      concurrency: sourceConcurrency
-    })
+    )
   ]);
 
-  const hostnameSummary = summarizeHttpResults(hostnameResults);
-  const directIdentities = directIpTargets
-    .map((v) => v.resolvedIdentity)
-    .filter(Boolean);
+  const dnsResults = await sampleUrl(
+    `${SERVICE_A_URL}/whoami`,
+    dnsSamples,
+    Math.min(sourceConcurrency, dnsSamples),
+    timeoutMs
+  );
+  const dnsSummary = summarizeHttpResults(dnsResults);
 
   return {
     generatedAt: new Date().toISOString(),
@@ -396,8 +379,7 @@ async function buildLocalProbeReport(searchParams) {
       serviceAUrl: SERVICE_A_URL,
       selfUrl: SELF_URL,
       timeoutMs,
-      samplesPerIp,
-      hostnameSamples,
+      dnsSamples,
       sourceConcurrency
     },
     discovery: {
@@ -414,20 +396,16 @@ async function buildLocalProbeReport(searchParams) {
     },
     dig: {
       serviceA: serviceADns,
-      self: selfDns
+      self: selfDns,
+      fromServiceA: serviceADigFromServiceA
     },
-    hostnameProbe: {
-      attempted: hostnameSummary.attempted,
-      okResponses: hostnameSummary.okResponses,
-      failedResponses: hostnameSummary.failedResponses,
-      errorCounts: hostnameSummary.errorCounts,
-      identitySummary: hostnameSummary.identitySummary
-    },
-    directIpProbe: {
-      attemptedTargets: directIpTargets.length,
-      reachableTargets: directIpTargets.filter((v) => v.okResponses > 0).length,
-      targets: directIpTargets,
-      identitySummary: summarizeIdentities(directIdentities)
+    dnsProbe: {
+      attempted: dnsSummary.attempted,
+      okResponses: dnsSummary.okResponses,
+      failedResponses: dnsSummary.failedResponses,
+      errorCounts: dnsSummary.errorCounts,
+      identitySummary: dnsSummary.identitySummary,
+      stickiness: buildStickiness(dnsSummary.identitySummary, dnsSummary.attempted)
     }
   };
 }
