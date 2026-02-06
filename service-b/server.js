@@ -509,10 +509,9 @@ function compactSourceReport(item) {
     local: report?.local || null,
     serviceA: {
       resolvedIps: report?.discovery?.serviceA?.ips || [],
-      hostnameRegions: report?.hostnameProbe?.identitySummary?.regions || [],
-      hostnameReplicas: report?.hostnameProbe?.identitySummary?.replicas || [],
-      directRegions: report?.directIpProbe?.identitySummary?.regions || [],
-      directReplicas: report?.directIpProbe?.identitySummary?.replicas || []
+      dnsRegions: report?.dnsProbe?.identitySummary?.regions || [],
+      dnsReplicas: report?.dnsProbe?.identitySummary?.replicas || [],
+      stickiness: report?.dnsProbe?.stickiness || null
     },
     errors: item.response?.ok ? null : item.response?.error || item.response?.status || "unknown_error"
   };
