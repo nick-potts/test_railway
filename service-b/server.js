@@ -13,7 +13,6 @@ const SELF_URL = (
 ).replace(/\/+$/, "");
 
 const REQUEST_TIMEOUT_MS_DEFAULT = Number(process.env.REQUEST_TIMEOUT_MS || 3000);
-const SAMPLES_PER_IP_DEFAULT = Number(process.env.SAMPLES_PER_IP || 2);
 const HOSTNAME_SAMPLES_DEFAULT = Number(process.env.HOSTNAME_SAMPLES || 12);
 const SOURCE_CONCURRENCY_DEFAULT = Number(process.env.SOURCE_CONCURRENCY || 10);
 const FANOUT_CONCURRENCY_DEFAULT = Number(process.env.FANOUT_CONCURRENCY || 10);
@@ -308,47 +307,25 @@ function summarizeHttpResults(results) {
   };
 }
 
-function pickResolvedIdentity(identities) {
-  if (identities.length === 0) return null;
-  const counts = new Map();
-  for (const id of identities) {
-    const key = `${id.service}:${id.region}:${id.replicaId}`;
-    if (!counts.has(key)) counts.set(key, { id, hits: 0 });
-    counts.get(key).hits += 1;
-  }
-  return Array.from(counts.values()).sort((a, b) => b.hits - a.hits)[0].id;
-}
+function buildStickiness(identitySummary, attempted) {
+  const rows = Array.isArray(identitySummary?.byReplica) ? identitySummary.byReplica : [];
+  const uniqueDestReplicas = rows.length;
+  const uniqueDestRegions = Array.isArray(identitySummary?.regions) ? identitySummary.regions.length : 0;
+  const totalHits = rows.reduce((sum, row) => sum + (row.hits || 0), 0);
+  const top = rows.slice().sort((a, b) => (b.hits || 0) - (a.hits || 0))[0] || null;
+  const topReplicaHitPct = totalHits > 0 && top ? Number(((top.hits / totalHits) * 100).toFixed(2)) : 0;
 
-async function probeIpTargets({
-  ips,
-  port,
-  hostHeader,
-  path,
-  samplesPerIp,
-  timeoutMs,
-  concurrency
-}) {
-  return mapWithConcurrency(ips, concurrency, async (ip) => {
-    const targetUrl = `http://${ip}:${port}${path}`;
-    const results = await sampleUrl(
-      targetUrl,
-      samplesPerIp,
-      Math.min(samplesPerIp, 4),
-      timeoutMs,
-      hostHeader ? { host: hostHeader } : {}
-    );
-    const summary = summarizeHttpResults(results);
-    return {
-      ip,
-      targetUrl,
-      attempted: summary.attempted,
-      okResponses: summary.okResponses,
-      failedResponses: summary.failedResponses,
-      errorCounts: summary.errorCounts,
-      resolvedIdentity: pickResolvedIdentity(summary.identities),
-      observedIdentities: summary.identitySummary.byReplica
-    };
-  });
+  return {
+    attempted,
+    observedHits: totalHits,
+    uniqueDestReplicas,
+    uniqueDestRegions,
+    topReplica: top
+      ? { replicaId: top.replicaId, region: top.region, hits: top.hits }
+      : null,
+    topReplicaHitPct,
+    allHitsToSingleReplica: uniqueDestReplicas === 1 && totalHits > 0
+  };
 }
 
 async function buildLocalProbeReport(searchParams) {
