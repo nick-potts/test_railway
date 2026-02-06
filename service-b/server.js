@@ -22,6 +22,11 @@ function json(res, status, payload) {
   res.end(JSON.stringify(payload, null, 2));
 }
 
+function html(res, status, body) {
+  res.writeHead(status, { "content-type": "text/html; charset=utf-8" });
+  res.end(body);
+}
+
 function parseIntOrDefault(raw, fallback, min = 1, max = 1000) {
   if (raw === null || raw === undefined) return fallback;
   if (typeof raw === "string" && raw.trim() === "") return fallback;
@@ -279,15 +284,82 @@ function summarizeIdentities(identities) {
   };
 }
 
+function percentile(sortedValues, pct) {
+  if (!Array.isArray(sortedValues) || sortedValues.length === 0) return null;
+  if (sortedValues.length === 1) return sortedValues[0];
+  const clamped = Math.max(0, Math.min(100, pct));
+  const position = (clamped / 100) * (sortedValues.length - 1);
+  const lower = Math.floor(position);
+  const upper = Math.ceil(position);
+  if (lower === upper) return sortedValues[lower];
+  const weight = position - lower;
+  return sortedValues[lower] * (1 - weight) + sortedValues[upper] * weight;
+}
+
+function buildLatencyStats(samples) {
+  const values = samples
+    .map((v) => Number(v))
+    .filter((v) => Number.isFinite(v) && v >= 0)
+    .sort((a, b) => a - b);
+
+  if (values.length === 0) {
+    return {
+      count: 0,
+      minMs: null,
+      maxMs: null,
+      avgMs: null,
+      p50Ms: null,
+      p95Ms: null
+    };
+  }
+
+  const sum = values.reduce((acc, v) => acc + v, 0);
+  return {
+    count: values.length,
+    minMs: Number(values[0].toFixed(2)),
+    maxMs: Number(values[values.length - 1].toFixed(2)),
+    avgMs: Number((sum / values.length).toFixed(2)),
+    p50Ms: Number(percentile(values, 50).toFixed(2)),
+    p95Ms: Number(percentile(values, 95).toFixed(2))
+  };
+}
+
 function summarizeHttpResults(results) {
   const identities = [];
   const errorCounts = {};
+  const successLatencies = [];
+  const latenciesByReplica = new Map();
+  const latenciesByRegion = new Map();
 
   for (const result of results) {
     if (result && result.ok && result.status >= 200 && result.status < 300) {
       const id = extractIdentity(result.data);
       if (id) {
         identities.push(id);
+        const elapsed = Number(result.elapsedMs);
+        if (Number.isFinite(elapsed) && elapsed >= 0) {
+          successLatencies.push(elapsed);
+          const replicaKey = `${id.service}:${id.region}:${id.replicaId}`;
+          if (!latenciesByReplica.has(replicaKey)) {
+            latenciesByReplica.set(replicaKey, {
+              service: id.service,
+              region: id.region,
+              replicaId: id.replicaId,
+              samples: []
+            });
+          }
+          latenciesByReplica.get(replicaKey).samples.push(elapsed);
+
+          const regionKey = `${id.service}:${id.region}`;
+          if (!latenciesByRegion.has(regionKey)) {
+            latenciesByRegion.set(regionKey, {
+              service: id.service,
+              region: id.region,
+              samples: []
+            });
+          }
+          latenciesByRegion.get(regionKey).samples.push(elapsed);
+        }
       } else {
         errorCounts.missing_identity_payload = (errorCounts.missing_identity_payload || 0) + 1;
       }
@@ -303,7 +375,29 @@ function summarizeHttpResults(results) {
     failedResponses: results.length - identities.length,
     errorCounts,
     identities,
-    identitySummary: summarizeIdentities(identities)
+    identitySummary: summarizeIdentities(identities),
+    latencySummary: {
+      overall: buildLatencyStats(successLatencies),
+      byReplica: Array.from(latenciesByReplica.values())
+        .map((entry) => ({
+          service: entry.service,
+          region: entry.region,
+          replicaId: entry.replicaId,
+          ...buildLatencyStats(entry.samples)
+        }))
+        .sort((a, b) =>
+          `${a.service}:${a.region}:${a.replicaId}`.localeCompare(
+            `${b.service}:${b.region}:${b.replicaId}`
+          )
+        ),
+      byRegion: Array.from(latenciesByRegion.values())
+        .map((entry) => ({
+          service: entry.service,
+          region: entry.region,
+          ...buildLatencyStats(entry.samples)
+        }))
+        .sort((a, b) => `${a.service}:${a.region}`.localeCompare(`${b.service}:${b.region}`))
+    }
   };
 }
 
@@ -405,6 +499,7 @@ async function buildLocalProbeReport(searchParams) {
       failedResponses: dnsSummary.failedResponses,
       errorCounts: dnsSummary.errorCounts,
       identitySummary: dnsSummary.identitySummary,
+      latencySummary: dnsSummary.latencySummary,
       stickiness: buildStickiness(dnsSummary.identitySummary, dnsSummary.attempted)
     }
   };
@@ -416,9 +511,15 @@ function aggregateSourceReports(sourceResults) {
   const dnsDestRegions = new Set();
   const dnsDestReplicas = new Set();
   const dnsMatrix = new Map();
+  const regionLatencyMatrix = new Map();
+  const replicaLatencyLinks = [];
   const expectedDestIps = new Set();
   const stickinessBySource = [];
   const errors = {};
+  let totalLatencyCount = 0;
+  let totalLatencyWeightedSum = 0;
+  let minLatencyOverall = Number.POSITIVE_INFINITY;
+  let maxLatencyOverall = 0;
 
   for (const source of sourceResults) {
     if (!(source.response && source.response.ok && source.response.status >= 200 && source.response.status < 300)) {
@@ -447,17 +548,28 @@ function aggregateSourceReports(sourceResults) {
     const dnsByReplica = Array.isArray(report?.dnsProbe?.identitySummary?.byReplica)
       ? report.dnsProbe.identitySummary.byReplica
       : [];
+    const dnsLatencyByReplica = Array.isArray(report?.dnsProbe?.latencySummary?.byReplica)
+      ? report.dnsProbe.latencySummary.byReplica
+      : [];
+    const latencyByReplicaKey = new Map(
+      dnsLatencyByReplica.map((entry) => [`${entry.service}:${entry.region}:${entry.replicaId}`, entry])
+    );
 
     for (const item of dnsByReplica) {
       const edge = `${sourceId.region}=>${item.region}`;
       dnsDestRegions.add(item.region);
       dnsDestReplicas.add(`${item.region}:${item.replicaId}`);
+      const latency = latencyByReplicaKey.get(`${item.service}:${item.region}:${item.replicaId}`) || null;
 
       if (!dnsMatrix.has(edge)) {
         dnsMatrix.set(edge, {
           sourceRegion: sourceId.region,
           destRegion: item.region,
           hits: 0,
+          latencyWeightedSum: 0,
+          latencyCount: 0,
+          minLatencyMs: Number.POSITIVE_INFINITY,
+          maxLatencyMs: 0,
           sourceReplicas: new Set(),
           destReplicas: new Set()
         });
@@ -466,6 +578,69 @@ function aggregateSourceReports(sourceResults) {
       edgeItem.hits += item.hits;
       edgeItem.sourceReplicas.add(sourceId.replicaId);
       edgeItem.destReplicas.add(item.replicaId);
+      if (latency && Number.isFinite(latency.avgMs) && Number.isFinite(latency.count) && latency.count > 0) {
+        edgeItem.latencyWeightedSum += latency.avgMs * latency.count;
+        edgeItem.latencyCount += latency.count;
+        if (Number.isFinite(latency.minMs)) {
+          edgeItem.minLatencyMs = Math.min(edgeItem.minLatencyMs, latency.minMs);
+          minLatencyOverall = Math.min(minLatencyOverall, latency.minMs);
+        }
+        if (Number.isFinite(latency.maxMs)) {
+          edgeItem.maxLatencyMs = Math.max(edgeItem.maxLatencyMs, latency.maxMs);
+          maxLatencyOverall = Math.max(maxLatencyOverall, latency.maxMs);
+        }
+        totalLatencyWeightedSum += latency.avgMs * latency.count;
+        totalLatencyCount += latency.count;
+      }
+
+      replicaLatencyLinks.push({
+        sourceService: sourceId.service,
+        sourceRegion: sourceId.region,
+        sourceReplicaId: sourceId.replicaId,
+        destService: item.service,
+        destRegion: item.region,
+        destReplicaId: item.replicaId,
+        hits: item.hits,
+        latency: latency
+          ? {
+              count: latency.count,
+              minMs: latency.minMs,
+              maxMs: latency.maxMs,
+              avgMs: latency.avgMs,
+              p50Ms: latency.p50Ms,
+              p95Ms: latency.p95Ms
+            }
+          : null
+      });
+
+      const regionLatencyKey = `${sourceId.region}=>${item.region}`;
+      if (!regionLatencyMatrix.has(regionLatencyKey)) {
+        regionLatencyMatrix.set(regionLatencyKey, {
+          sourceRegion: sourceId.region,
+          destRegion: item.region,
+          hits: 0,
+          latencyWeightedSum: 0,
+          latencyCount: 0,
+          minLatencyMs: Number.POSITIVE_INFINITY,
+          maxLatencyMs: 0,
+          sourceReplicas: new Set(),
+          destReplicas: new Set()
+        });
+      }
+      const regionLatency = regionLatencyMatrix.get(regionLatencyKey);
+      regionLatency.hits += item.hits;
+      regionLatency.sourceReplicas.add(sourceId.replicaId);
+      regionLatency.destReplicas.add(item.replicaId);
+      if (latency && Number.isFinite(latency.avgMs) && Number.isFinite(latency.count) && latency.count > 0) {
+        regionLatency.latencyWeightedSum += latency.avgMs * latency.count;
+        regionLatency.latencyCount += latency.count;
+        if (Number.isFinite(latency.minMs)) {
+          regionLatency.minLatencyMs = Math.min(regionLatency.minLatencyMs, latency.minMs);
+        }
+        if (Number.isFinite(latency.maxMs)) {
+          regionLatency.maxLatencyMs = Math.max(regionLatency.maxLatencyMs, latency.maxMs);
+        }
+      }
     }
 
     stickinessBySource.push({
@@ -485,12 +660,53 @@ function aggregateSourceReports(sourceResults) {
         sourceRegion: v.sourceRegion,
         destRegion: v.destRegion,
         hits: v.hits,
+        avgLatencyMs:
+          v.latencyCount > 0 ? Number((v.latencyWeightedSum / v.latencyCount).toFixed(2)) : null,
+        minLatencyMs:
+          Number.isFinite(v.minLatencyMs) && v.minLatencyMs !== Number.POSITIVE_INFINITY
+            ? Number(v.minLatencyMs.toFixed(2))
+            : null,
+        maxLatencyMs: Number.isFinite(v.maxLatencyMs) && v.maxLatencyMs > 0 ? Number(v.maxLatencyMs.toFixed(2)) : null,
         sourceReplicaCount: v.sourceReplicas.size,
         destReplicaCount: v.destReplicas.size,
         sourceReplicas: Array.from(v.sourceReplicas).sort(),
         destReplicas: Array.from(v.destReplicas).sort()
       }))
       .sort((a, b) => `${a.sourceRegion}:${a.destRegion}`.localeCompare(`${b.sourceRegion}:${b.destRegion}`)),
+    regionLatencyMatrix: Array.from(regionLatencyMatrix.values())
+      .map((v) => ({
+        sourceRegion: v.sourceRegion,
+        destRegion: v.destRegion,
+        hits: v.hits,
+        avgLatencyMs:
+          v.latencyCount > 0 ? Number((v.latencyWeightedSum / v.latencyCount).toFixed(2)) : null,
+        minLatencyMs:
+          Number.isFinite(v.minLatencyMs) && v.minLatencyMs !== Number.POSITIVE_INFINITY
+            ? Number(v.minLatencyMs.toFixed(2))
+            : null,
+        maxLatencyMs: Number.isFinite(v.maxLatencyMs) && v.maxLatencyMs > 0 ? Number(v.maxLatencyMs.toFixed(2)) : null,
+        sourceReplicaCount: v.sourceReplicas.size,
+        destReplicaCount: v.destReplicas.size,
+        sourceReplicas: Array.from(v.sourceReplicas).sort(),
+        destReplicas: Array.from(v.destReplicas).sort()
+      }))
+      .sort((a, b) => `${a.sourceRegion}:${a.destRegion}`.localeCompare(`${b.sourceRegion}:${b.destRegion}`)),
+    replicaLatencyLinks: replicaLatencyLinks.sort((a, b) =>
+      `${a.sourceRegion}:${a.sourceReplicaId}:${a.destRegion}:${a.destReplicaId}`.localeCompare(
+        `${b.sourceRegion}:${b.sourceReplicaId}:${b.destRegion}:${b.destReplicaId}`
+      )
+    ),
+    latencyOverall: {
+      count: totalLatencyCount,
+      avgLatencyMs:
+        totalLatencyCount > 0 ? Number((totalLatencyWeightedSum / totalLatencyCount).toFixed(2)) : null,
+      minLatencyMs:
+        Number.isFinite(minLatencyOverall) && minLatencyOverall !== Number.POSITIVE_INFINITY
+          ? Number(minLatencyOverall.toFixed(2))
+          : null,
+      maxLatencyMs:
+        Number.isFinite(maxLatencyOverall) && maxLatencyOverall > 0 ? Number(maxLatencyOverall.toFixed(2)) : null
+    },
     expectedDestIps: Array.from(expectedDestIps).sort(),
     stickinessBySource: stickinessBySource.sort((a, b) =>
       (a.sourceReplica || "").localeCompare(b.sourceReplica || "")
@@ -626,6 +842,9 @@ async function buildCombinedReport(searchParams) {
       dnsDestRegions: aggregate.dnsDestRegions,
       dnsDestReplicas: aggregate.dnsDestReplicas,
       dnsMatrix: aggregate.dnsMatrix,
+      regionLatencyMatrix: aggregate.regionLatencyMatrix,
+      replicaLatencyLinks: aggregate.replicaLatencyLinks,
+      latencyOverall: aggregate.latencyOverall,
       expectedDestIps: aggregate.expectedDestIps,
       stickinessBySource: aggregate.stickinessBySource,
       errorCounts: aggregate.errorCounts
@@ -651,6 +870,774 @@ async function buildCombinedReport(searchParams) {
     ...base,
     sourceReports: sourceResults.map(compactSourceReport)
   };
+}
+
+function buildMapHtml() {
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Railway Replica Latency Map</title>
+  <style>
+    :root {
+      --bg: #08111f;
+      --bg2: #10243b;
+      --surface: rgba(9, 19, 33, 0.72);
+      --surface-border: rgba(142, 175, 204, 0.2);
+      --text: #d9ebff;
+      --muted: #8eacc9;
+      --source: #4dd2ff;
+      --dest: #ffd166;
+      --good: #20c997;
+      --warn: #ffb347;
+      --bad: #ff6b57;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      color: var(--text);
+      background:
+        radial-gradient(circle at 12% 8%, rgba(32, 201, 151, 0.16), transparent 34%),
+        radial-gradient(circle at 85% 5%, rgba(77, 210, 255, 0.12), transparent 36%),
+        linear-gradient(145deg, var(--bg), var(--bg2) 54%, #07101b);
+      font-family: "Avenir Next", "Trebuchet MS", "Segoe UI", sans-serif;
+      min-height: 100vh;
+    }
+
+    .page {
+      width: min(1400px, 96vw);
+      margin: 20px auto;
+      display: grid;
+      gap: 14px;
+    }
+
+    .hero {
+      background: var(--surface);
+      border: 1px solid var(--surface-border);
+      border-radius: 16px;
+      padding: 14px 18px;
+      backdrop-filter: blur(8px);
+    }
+
+    .hero h1 {
+      margin: 0 0 6px 0;
+      font-size: clamp(1.05rem, 1.8vw, 1.5rem);
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+
+    .hero p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 0.9rem;
+      line-height: 1.35;
+    }
+
+    .layout {
+      display: grid;
+      grid-template-columns: 1.7fr 1fr;
+      gap: 14px;
+    }
+
+    .panel {
+      background: var(--surface);
+      border: 1px solid var(--surface-border);
+      border-radius: 16px;
+      overflow: hidden;
+      backdrop-filter: blur(10px);
+    }
+
+    .map-wrap {
+      padding: 0;
+      position: relative;
+      min-height: 640px;
+    }
+
+    #map {
+      width: 100%;
+      height: 100%;
+      display: block;
+      background:
+        radial-gradient(circle at 35% 28%, rgba(89, 178, 255, 0.08), transparent 45%),
+        radial-gradient(circle at 74% 78%, rgba(32, 201, 151, 0.08), transparent 50%),
+        linear-gradient(180deg, rgba(4, 9, 17, 0.92), rgba(10, 20, 35, 0.94));
+    }
+
+    .status {
+      position: absolute;
+      top: 10px;
+      left: 12px;
+      padding: 6px 10px;
+      border-radius: 999px;
+      font-size: 0.78rem;
+      color: #eaf5ff;
+      border: 1px solid rgba(183, 210, 233, 0.25);
+      background: rgba(5, 14, 26, 0.75);
+      z-index: 10;
+    }
+
+    .legend {
+      position: absolute;
+      right: 12px;
+      bottom: 12px;
+      background: rgba(5, 14, 26, 0.82);
+      border: 1px solid rgba(183, 210, 233, 0.25);
+      border-radius: 10px;
+      padding: 8px 10px;
+      font-size: 0.78rem;
+      color: var(--muted);
+      display: grid;
+      gap: 6px;
+      z-index: 10;
+    }
+
+    .legend-row {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      white-space: nowrap;
+    }
+
+    .swatch {
+      width: 22px;
+      height: 3px;
+      border-radius: 999px;
+      flex: 0 0 auto;
+    }
+
+    .info {
+      padding: 14px;
+      display: grid;
+      gap: 12px;
+    }
+
+    .card {
+      border: 1px solid rgba(152, 184, 210, 0.16);
+      border-radius: 12px;
+      padding: 10px 12px;
+      background: rgba(8, 18, 32, 0.72);
+    }
+
+    .card h2 {
+      margin: 0 0 8px 0;
+      font-size: 0.9rem;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: #e8f4ff;
+    }
+
+    .kv {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 6px 10px;
+      font-size: 0.84rem;
+      color: var(--muted);
+    }
+
+    .kv b {
+      color: #ecf7ff;
+      font-weight: 600;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.78rem;
+      color: var(--muted);
+    }
+
+    th, td {
+      padding: 6px 4px;
+      border-bottom: 1px solid rgba(157, 190, 217, 0.12);
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      color: #e8f4ff;
+      font-size: 0.73rem;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      font-weight: 600;
+      position: sticky;
+      top: 0;
+      background: rgba(8, 18, 32, 0.92);
+      z-index: 2;
+    }
+
+    .table-scroll {
+      max-height: 360px;
+      overflow: auto;
+      border-radius: 8px;
+    }
+
+    .small {
+      color: var(--muted);
+      font-size: 0.72rem;
+      line-height: 1.35;
+    }
+
+    .mono {
+      font-family: "Menlo", "Consolas", "SFMono-Regular", monospace;
+    }
+
+    .node-source { fill: var(--source); }
+    .node-dest { fill: var(--dest); }
+    .node-ring {
+      fill: none;
+      stroke: rgba(207, 230, 250, 0.3);
+      stroke-width: 1.1;
+    }
+    .region-label {
+      fill: #d6e8fb;
+      font-size: 10px;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      paint-order: stroke;
+      stroke: rgba(5, 12, 22, 0.9);
+      stroke-width: 3;
+      stroke-linejoin: round;
+      font-weight: 700;
+    }
+    .replica-label {
+      fill: rgba(207, 230, 250, 0.9);
+      font-size: 8px;
+      letter-spacing: 0.03em;
+      paint-order: stroke;
+      stroke: rgba(7, 15, 26, 0.85);
+      stroke-width: 2;
+    }
+    .link {
+      fill: none;
+      stroke-linecap: round;
+      animation: pulse 7s linear infinite;
+    }
+    @keyframes pulse {
+      from { stroke-dashoffset: 0; }
+      to { stroke-dashoffset: -90; }
+    }
+
+    .land {
+      fill: rgba(88, 146, 194, 0.12);
+      stroke: rgba(161, 195, 223, 0.12);
+      stroke-width: 1;
+    }
+    .grid-line {
+      stroke: rgba(159, 191, 218, 0.12);
+      stroke-width: 1;
+      fill: none;
+    }
+
+    @media (max-width: 1080px) {
+      .layout {
+        grid-template-columns: 1fr;
+      }
+      .map-wrap {
+        min-height: 500px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <section class="hero">
+      <h1>Railway Cross-Service Replica Latency Map</h1>
+      <p>Source fanout: <span class="mono">service-b</span> replica IPs. Destination routing: DNS only via <span class="mono">service-a.railway.internal</span>. Links show latency and hit distribution per source replica.</p>
+    </section>
+
+    <section class="layout">
+      <article class="panel map-wrap">
+        <div class="status" id="status">Loading</div>
+        <svg id="map" viewBox="0 0 1200 660" preserveAspectRatio="xMidYMid meet" aria-label="Replica latency map">
+          <g id="gridLayer"></g>
+          <g id="landLayer"></g>
+          <g id="linkLayer"></g>
+          <g id="nodeLayer"></g>
+          <g id="labelLayer"></g>
+        </svg>
+        <div class="legend">
+          <div class="legend-row"><span class="swatch" style="background: var(--good)"></span><span>Low latency (&lt;80ms)</span></div>
+          <div class="legend-row"><span class="swatch" style="background: var(--warn)"></span><span>Medium latency (80-180ms)</span></div>
+          <div class="legend-row"><span class="swatch" style="background: var(--bad)"></span><span>High latency (&gt;180ms)</span></div>
+          <div class="legend-row"><span style="width:10px;height:10px;border-radius:50%;background:var(--source);display:inline-block"></span><span>Source replicas (service-b)</span></div>
+          <div class="legend-row"><span style="width:10px;height:10px;border-radius:50%;background:var(--dest);display:inline-block"></span><span>Destination replicas (service-a)</span></div>
+        </div>
+      </article>
+
+      <aside class="panel info">
+        <div class="card">
+          <h2>Summary</h2>
+          <div class="kv">
+            <span>Endpoint</span><b id="endpoint" class="mono">/combined</b>
+            <span>Generated At</span><b id="generatedAt">-</b>
+            <span>Source Regions</span><b id="srcRegions">-</b>
+            <span>Source Replicas</span><b id="srcReplicas">-</b>
+            <span>Destination Regions</span><b id="dstRegions">-</b>
+            <span>Destination Replicas</span><b id="dstReplicas">-</b>
+            <span>Total Link Samples</span><b id="totalSamples">-</b>
+            <span>Overall Avg Latency</span><b id="avgLatency">-</b>
+            <span>Observed Min/Max</span><b id="minMaxLatency">-</b>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>Region Matrix (avg ms)</h2>
+          <div class="table-scroll">
+            <table>
+              <thead>
+                <tr>
+                  <th>Source Region</th>
+                  <th>Dest Region</th>
+                  <th>Hits</th>
+                  <th>Avg</th>
+                  <th>Min</th>
+                  <th>Max</th>
+                </tr>
+              </thead>
+              <tbody id="regionMatrixRows"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>Replica Links</h2>
+          <div class="table-scroll">
+            <table>
+              <thead>
+                <tr>
+                  <th>Source</th>
+                  <th>Dest</th>
+                  <th>Hits</th>
+                  <th>Avg</th>
+                  <th>P95</th>
+                </tr>
+              </thead>
+              <tbody id="replicaRows"></tbody>
+            </table>
+          </div>
+          <p class="small">Rows are source-replica to destination-replica DNS routes. High single-link concentration indicates sticky routing from that source replica.</p>
+        </div>
+      </aside>
+    </section>
+  </div>
+
+  <script>
+    (function () {
+      var svgNs = 'http://www.w3.org/2000/svg';
+      var mapEl = document.getElementById('map');
+      var gridLayer = document.getElementById('gridLayer');
+      var landLayer = document.getElementById('landLayer');
+      var linkLayer = document.getElementById('linkLayer');
+      var nodeLayer = document.getElementById('nodeLayer');
+      var labelLayer = document.getElementById('labelLayer');
+      var width = 1200;
+      var height = 660;
+
+      var regionCoords = {
+        'us-west1': { lat: 37.39, lon: -122.08 },
+        'us-west2': { lat: 34.05, lon: -118.24 },
+        'us-west3': { lat: 40.76, lon: -111.89 },
+        'us-west4': { lat: 36.17, lon: -115.14 },
+        'us-central1': { lat: 41.26, lon: -95.86 },
+        'us-east1': { lat: 33.75, lon: -84.39 },
+        'us-east4': { lat: 37.43, lon: -78.65 },
+        'europe-west1': { lat: 50.11, lon: 8.68 },
+        'europe-west2': { lat: 51.5, lon: -0.12 },
+        'europe-west3': { lat: 50.93, lon: 6.95 },
+        'europe-west4': { lat: 52.37, lon: 4.9 },
+        'europe-north1': { lat: 60.17, lon: 24.94 },
+        'asia-southeast1': { lat: 1.35, lon: 103.82 },
+        'asia-southeast2': { lat: -6.21, lon: 106.85 },
+        'asia-east1': { lat: 25.03, lon: 121.56 },
+        'asia-east2': { lat: 22.3, lon: 114.16 },
+        'asia-northeast1': { lat: 35.67, lon: 139.65 },
+        'asia-northeast2': { lat: 37.56, lon: 126.98 },
+        'asia-south1': { lat: 19.07, lon: 72.88 },
+        'asia-south2': { lat: 17.38, lon: 78.49 },
+        'australia-southeast1': { lat: -33.87, lon: 151.21 },
+        'southamerica-east1': { lat: -23.55, lon: -46.63 }
+      };
+
+      function create(tag, attrs) {
+        var el = document.createElementNS(svgNs, tag);
+        Object.keys(attrs || {}).forEach(function (key) {
+          if (attrs[key] !== null && attrs[key] !== undefined) {
+            el.setAttribute(key, String(attrs[key]));
+          }
+        });
+        return el;
+      }
+
+      function clear(el) {
+        while (el.firstChild) el.removeChild(el.firstChild);
+      }
+
+      function setText(id, value) {
+        var el = document.getElementById(id);
+        if (el) el.textContent = value;
+      }
+
+      function fmtMs(value) {
+        return Number.isFinite(value) ? value.toFixed(1) + ' ms' : '-';
+      }
+
+      function normalizeRegion(region) {
+        var raw = String(region || 'unknown').toLowerCase();
+        if (regionCoords[raw]) return raw;
+        var stripped = raw.replace(/-[a-z0-9]{4,}$/i, '');
+        if (regionCoords[stripped]) return stripped;
+        return stripped;
+      }
+
+      function prettyRegion(region) {
+        return String(region || 'unknown').replace(/-[a-z0-9]{4,}$/i, '');
+      }
+
+      function project(lon, lat) {
+        return {
+          x: ((lon + 180) / 360) * width,
+          y: ((90 - lat) / 180) * height
+        };
+      }
+
+      function latencyColor(avgMs) {
+        if (!Number.isFinite(avgMs)) return 'rgba(173, 205, 233, 0.55)';
+        if (avgMs < 80) return '#20c997';
+        if (avgMs < 180) return '#ffb347';
+        return '#ff6b57';
+      }
+
+      function strokeWidth(hits) {
+        var h = Number(hits || 0);
+        return Math.max(1.2, Math.min(7, 1 + h / 6));
+      }
+
+      function parseReplica(raw) {
+        var text = String(raw || '');
+        var idx = text.indexOf(':');
+        if (idx < 0) return { region: 'unknown', replicaId: text || 'unknown' };
+        return {
+          region: text.slice(0, idx),
+          replicaId: text.slice(idx + 1)
+        };
+      }
+
+      function nodeId(kind, region, replicaId) {
+        return kind + '|' + region + '|' + replicaId;
+      }
+
+      function toShortReplica(id) {
+        if (!id) return 'unknown';
+        return id.slice(0, 8);
+      }
+
+      function curvedPath(x1, y1, x2, y2) {
+        var mx = (x1 + x2) / 2;
+        var my = (y1 + y2) / 2;
+        var dx = x2 - x1;
+        var dy = y2 - y1;
+        var distance = Math.sqrt(dx * dx + dy * dy) || 1;
+        var nx = -dy / distance;
+        var ny = dx / distance;
+        var curve = Math.min(120, 40 + distance * 0.15);
+        var cx = mx + nx * curve;
+        var cy = my + ny * curve;
+        return 'M ' + x1 + ' ' + y1 + ' Q ' + cx + ' ' + cy + ' ' + x2 + ' ' + y2;
+      }
+
+      function drawBackground() {
+        clear(gridLayer);
+        clear(landLayer);
+
+        for (var lat = -60; lat <= 60; lat += 30) {
+          var y = project(0, lat).y;
+          gridLayer.appendChild(create('path', {
+            d: 'M 0 ' + y + ' L ' + width + ' ' + y,
+            class: 'grid-line'
+          }));
+        }
+
+        for (var lon = -150; lon <= 150; lon += 30) {
+          var x = project(lon, 0).x;
+          gridLayer.appendChild(create('path', {
+            d: 'M ' + x + ' 0 L ' + x + ' ' + height,
+            class: 'grid-line'
+          }));
+        }
+
+        var landShapes = [
+          'M 85 170 C 170 90, 315 80, 390 135 C 460 185, 465 290, 395 350 C 335 400, 255 410, 190 375 C 115 330, 72 245, 85 170 Z',
+          'M 475 125 C 555 80, 645 95, 710 140 C 760 176, 765 248, 715 293 C 660 344, 560 355, 500 320 C 430 280, 415 190, 475 125 Z',
+          'M 660 355 C 745 332, 845 360, 900 410 C 948 454, 943 528, 886 565 C 827 603, 730 600, 678 552 C 620 500, 612 414, 660 355 Z'
+        ];
+        landShapes.forEach(function (shape) {
+          landLayer.appendChild(create('path', { d: shape, class: 'land' }));
+        });
+      }
+
+      function buildNodePositions(report) {
+        var bridge = report.bridge || {};
+        var sourceReplicas = Array.isArray(bridge.sourceReplicas) ? bridge.sourceReplicas : [];
+        var destReplicas = Array.isArray(bridge.dnsDestReplicas) ? bridge.dnsDestReplicas : [];
+        var regions = new Set();
+        var nodes = [];
+
+        sourceReplicas.forEach(function (raw) {
+          var parsed = parseReplica(raw);
+          nodes.push({ kind: 'source', region: parsed.region, replicaId: parsed.replicaId });
+          regions.add(parsed.region);
+        });
+        destReplicas.forEach(function (raw) {
+          var parsed = parseReplica(raw);
+          nodes.push({ kind: 'dest', region: parsed.region, replicaId: parsed.replicaId });
+          regions.add(parsed.region);
+        });
+
+        var uniqueRegions = Array.from(regions).sort();
+        var unknownRegions = [];
+        var regionAnchors = {};
+        uniqueRegions.forEach(function (region) {
+          var key = normalizeRegion(region);
+          var coords = regionCoords[key];
+          if (coords) {
+            regionAnchors[region] = project(coords.lon, coords.lat);
+          } else {
+            unknownRegions.push(region);
+          }
+        });
+
+        if (unknownRegions.length > 0) {
+          unknownRegions.forEach(function (region, idx) {
+            var columns = Math.min(4, unknownRegions.length);
+            var col = idx % columns;
+            var row = Math.floor(idx / columns);
+            var x = ((col + 1) / (columns + 1)) * width;
+            var y = height - 80 - row * 55;
+            regionAnchors[region] = { x: x, y: y };
+          });
+        }
+
+        var grouped = {};
+        nodes.forEach(function (node) {
+          var key = node.kind + '|' + node.region;
+          if (!grouped[key]) grouped[key] = [];
+          grouped[key].push(node);
+        });
+
+        var positioned = [];
+        Object.keys(grouped).forEach(function (groupKey) {
+          var list = grouped[groupKey];
+          var first = list[0];
+          var anchor = regionAnchors[first.region] || { x: width / 2, y: height / 2 };
+          var sideOffset = first.kind === 'source' ? -14 : 14;
+          var base = {
+            x: Math.max(20, Math.min(width - 20, anchor.x)),
+            y: Math.max(20, Math.min(height - 20, anchor.y + sideOffset))
+          };
+          var total = list.length;
+          list.forEach(function (node, index) {
+            var angle = ((Math.PI * 2) * index) / Math.max(total, 1) + (node.kind === 'source' ? -0.45 : 0.45);
+            var radius = 11 + Math.floor(index / 8) * 10;
+            var x = base.x + Math.cos(angle) * radius;
+            var y = base.y + Math.sin(angle) * radius;
+            positioned.push({
+              id: nodeId(node.kind, node.region, node.replicaId),
+              kind: node.kind,
+              region: node.region,
+              replicaId: node.replicaId,
+              x: Math.max(14, Math.min(width - 14, x)),
+              y: Math.max(14, Math.min(height - 14, y))
+            });
+          });
+        });
+
+        return { nodes: positioned, regionAnchors: regionAnchors };
+      }
+
+      function renderMap(report) {
+        drawBackground();
+        clear(linkLayer);
+        clear(nodeLayer);
+        clear(labelLayer);
+
+        var bridge = report.bridge || {};
+        var links = Array.isArray(bridge.replicaLatencyLinks) ? bridge.replicaLatencyLinks : [];
+        var positioned = buildNodePositions(report);
+        var nodeMap = {};
+        positioned.nodes.forEach(function (node) {
+          nodeMap[node.id] = node;
+        });
+
+        var linkEntries = links
+          .filter(function (link) {
+            return link && link.latency && Number.isFinite(link.latency.avgMs);
+          })
+          .map(function (link) {
+            var sourceKey = nodeId('source', link.sourceRegion, link.sourceReplicaId);
+            var destKey = nodeId('dest', link.destRegion, link.destReplicaId);
+            return {
+              link: link,
+              source: nodeMap[sourceKey],
+              dest: nodeMap[destKey]
+            };
+          })
+          .filter(function (item) {
+            return item.source && item.dest;
+          });
+
+        linkEntries.sort(function (a, b) {
+          return (a.link.latency.avgMs || 0) - (b.link.latency.avgMs || 0);
+        });
+
+        linkEntries.forEach(function (entry) {
+          var link = entry.link;
+          var avg = Number(link.latency.avgMs);
+          var path = create('path', {
+            d: curvedPath(entry.source.x, entry.source.y, entry.dest.x, entry.dest.y),
+            class: 'link',
+            stroke: latencyColor(avg),
+            'stroke-width': strokeWidth(link.hits),
+            'stroke-opacity': 0.72,
+            'stroke-dasharray': '8 6'
+          });
+          var title = create('title', {});
+          title.textContent =
+            entry.source.region + ':' + toShortReplica(entry.source.replicaId) + ' -> ' +
+            entry.dest.region + ':' + toShortReplica(entry.dest.replicaId) +
+            ' | avg=' + fmtMs(avg) + ' p95=' + fmtMs(link.latency.p95Ms) +
+            ' hits=' + String(link.hits || 0);
+          path.appendChild(title);
+          linkLayer.appendChild(path);
+        });
+
+        positioned.nodes.forEach(function (node) {
+          var ring = create('circle', {
+            cx: node.x,
+            cy: node.y,
+            r: 7.5,
+            class: 'node-ring'
+          });
+          nodeLayer.appendChild(ring);
+
+          var dot = create('circle', {
+            cx: node.x,
+            cy: node.y,
+            r: 4.2,
+            class: node.kind === 'source' ? 'node-source' : 'node-dest'
+          });
+          var dotTitle = create('title', {});
+          dotTitle.textContent = (node.kind === 'source' ? 'source ' : 'dest ') + node.region + ':' + node.replicaId;
+          dot.appendChild(dotTitle);
+          nodeLayer.appendChild(dot);
+        });
+
+        Object.keys(positioned.regionAnchors).forEach(function (region) {
+          var anchor = positioned.regionAnchors[region];
+          var label = create('text', {
+            x: anchor.x,
+            y: anchor.y - 18,
+            'text-anchor': 'middle',
+            class: 'region-label'
+          });
+          label.textContent = prettyRegion(region);
+          labelLayer.appendChild(label);
+        });
+      }
+
+      function renderTables(report) {
+        var bridge = report.bridge || {};
+        var regionRows = Array.isArray(bridge.regionLatencyMatrix) ? bridge.regionLatencyMatrix : [];
+        var replicaRows = Array.isArray(bridge.replicaLatencyLinks) ? bridge.replicaLatencyLinks : [];
+
+        var regionBody = document.getElementById('regionMatrixRows');
+        regionBody.innerHTML = '';
+        if (regionRows.length === 0) {
+          var empty = document.createElement('tr');
+          empty.innerHTML = '<td colspan="6">No region latency rows</td>';
+          regionBody.appendChild(empty);
+        } else {
+          regionRows.forEach(function (row) {
+            var tr = document.createElement('tr');
+            tr.innerHTML =
+              '<td>' + row.sourceRegion + '</td>' +
+              '<td>' + row.destRegion + '</td>' +
+              '<td>' + String(row.hits || 0) + '</td>' +
+              '<td>' + fmtMs(row.avgLatencyMs) + '</td>' +
+              '<td>' + fmtMs(row.minLatencyMs) + '</td>' +
+              '<td>' + fmtMs(row.maxLatencyMs) + '</td>';
+            regionBody.appendChild(tr);
+          });
+        }
+
+        var replicaBody = document.getElementById('replicaRows');
+        replicaBody.innerHTML = '';
+        var sortedReplica = replicaRows.slice().sort(function (a, b) {
+          var av = Number.isFinite(a && a.latency && a.latency.avgMs) ? a.latency.avgMs : Number.POSITIVE_INFINITY;
+          var bv = Number.isFinite(b && b.latency && b.latency.avgMs) ? b.latency.avgMs : Number.POSITIVE_INFINITY;
+          if (av === bv) return (b.hits || 0) - (a.hits || 0);
+          return av - bv;
+        });
+
+        if (sortedReplica.length === 0) {
+          var emptyReplica = document.createElement('tr');
+          emptyReplica.innerHTML = '<td colspan="5">No replica links</td>';
+          replicaBody.appendChild(emptyReplica);
+        } else {
+          sortedReplica.forEach(function (row) {
+            var tr = document.createElement('tr');
+            tr.innerHTML =
+              '<td class="mono">' + row.sourceRegion + ':' + toShortReplica(row.sourceReplicaId) + '</td>' +
+              '<td class="mono">' + row.destRegion + ':' + toShortReplica(row.destReplicaId) + '</td>' +
+              '<td>' + String(row.hits || 0) + '</td>' +
+              '<td>' + fmtMs(row.latency ? row.latency.avgMs : null) + '</td>' +
+              '<td>' + fmtMs(row.latency ? row.latency.p95Ms : null) + '</td>';
+            replicaBody.appendChild(tr);
+          });
+        }
+      }
+
+      function renderSummary(report, endpoint) {
+        var bridge = report.bridge || {};
+        var overall = bridge.latencyOverall || {};
+        setText('endpoint', endpoint);
+        setText('generatedAt', report.generatedAt || '-');
+        setText('srcRegions', String((bridge.sourceRegions || []).length));
+        setText('srcReplicas', String((bridge.sourceReplicas || []).length));
+        setText('dstRegions', String((bridge.dnsDestRegions || []).length));
+        setText('dstReplicas', String((bridge.dnsDestReplicas || []).length));
+        setText('totalSamples', String(overall.count || 0));
+        setText('avgLatency', fmtMs(overall.avgLatencyMs));
+        setText('minMaxLatency', fmtMs(overall.minLatencyMs) + ' / ' + fmtMs(overall.maxLatencyMs));
+      }
+
+      async function load() {
+        var query = window.location.search || '';
+        var endpoint = '/combined' + query;
+        setText('endpoint', endpoint);
+        setText('status', 'Loading ' + endpoint);
+        try {
+          var response = await fetch(endpoint, { headers: { accept: 'application/json' } });
+          if (!response.ok) {
+            throw new Error('HTTP ' + response.status);
+          }
+          var report = await response.json();
+          renderSummary(report, endpoint);
+          renderMap(report);
+          renderTables(report);
+          setText('status', 'Updated ' + new Date().toLocaleTimeString());
+        } catch (error) {
+          setText('status', 'Load failed: ' + (error && error.message ? error.message : 'unknown'));
+        }
+      }
+
+      load();
+    })();
+  </script>
+</body>
+</html>`;
 }
 
 const server = http.createServer(async (req, res) => {
@@ -702,6 +1689,16 @@ const server = http.createServer(async (req, res) => {
   if (url.pathname === "/combined") {
     const report = await buildCombinedReport(url.searchParams);
     json(res, 200, report);
+    return;
+  }
+
+  if (url.pathname === "/map") {
+    html(res, 200, buildMapHtml());
+    return;
+  }
+
+  if (url.pathname === "/map2") {
+    html(res, 200, buildMap2Html());
     return;
   }
 
