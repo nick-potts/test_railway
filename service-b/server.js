@@ -2028,7 +2028,7 @@ function buildMap2Html() {
       var midLat = (lat1 + lat2) / 2;
       var midLng = (lng1 + lng2) / 2;
       var dist = Math.sqrt((lat2 - lat1) * (lat2 - lat1) + (dLng) * (dLng));
-      var bulge = Math.max(8, dist * 0.35);
+      var bulge = Math.min(30, Math.max(5, dist * 0.18));
       var perpLat = -(lng2 - lng1);
       var perpLng = (lat2 - lat1);
       var perpLen = Math.sqrt(perpLat * perpLat + perpLng * perpLng) || 1;
